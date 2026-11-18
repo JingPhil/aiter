@@ -156,6 +156,8 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
     using vec8_t = bvec<8>;
     constexpr float LOG2_E = 1.44269504089f;
     __shared__ __attribute__((aligned(16))) bf16_t smem[SMEM_ELEMS];
+    // LSE and D of a query tile, [lse | D], double-buffered like sQ.
+    __shared__ float s_ld[2][2 * BQ];
 
     const int tid  = static_cast<int>(opus::thread_id_x());
     const int lane = tid % 64;
@@ -248,12 +250,15 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         *reinterpret_cast<vec8_t*>(smem + OFF_K + r * LD_K + c8) = v;
     }
 
-    // Query tiles go global -> registers -> LDS one tile ahead; rows past seqlen_q are 0.
+    // Query tiles, with their LSE and D, go global -> registers -> LDS one tile ahead; rows
+    // past seqlen_q are 0. A tile's global reads are all issued before the previous tile's
+    // dQ atomics, so waiting for them never waits for the atomics.
     constexpr int QC = BQ * D_QK / 8, QR = (QC + BLOCK - 1) / BLOCK;
     static_assert(BQ * D_V / 8 == BLOCK, "one dO chunk per thread");
     const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q);
     const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do);
     vec8_t r_q[QR], r_do;
+    float r_ld = 0.0f;
     auto fetch = [&](int i) {
         const int qt0 = i * BQ;
 #pragma unroll
@@ -274,8 +279,16 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         else
             for(int e = 0; e < 8; e++)
                 r_do[e] = bf16_t(0.0f);
+        if(tid < 2 * BQ)
+        {
+            const int qp = qt0 + tid % BQ;
+            r_ld = qp < seqlen_q ? (tid < BQ ? k.ptr_lse : k.ptr_d)[static_cast<long long>(h) * k.stride_lse_h + q0 + qp]
+                                 : 0.0f;
+        }
     };
     auto stage = [&](int buf) {
+        if(tid < 2 * BQ)
+            s_ld[buf][tid] = r_ld;
 #pragma unroll
         for(int u = 0; u < QR; u++)
         {
@@ -329,11 +342,8 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
 #pragma unroll
         for(int e = 0; e < NS; e++)
         {
-            const int qp       = qt0 + pos_s[e] % 256;
-            const long long li = static_cast<long long>(h) * k.stride_lse_h + q0 +
-                                 (qp < seqlen_q ? qp : seqlen_q - 1);
-            lse_e[e] = k.ptr_lse[li] * LOG2_E;
-            d_e[e]   = k.ptr_d[li];
+            lse_e[e] = s_ld[b][pos_s[e] % 256] * LOG2_E;
+            d_e[e]   = s_ld[b][BQ + pos_s[e] % 256];
         }
 
         const auto v_st  = mma_s(v_kw, s_q[b].template load<8>(u_q));
