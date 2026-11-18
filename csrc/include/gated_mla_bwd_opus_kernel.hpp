@@ -13,12 +13,80 @@
 
 namespace gated_mla_bwd {
 
+using bf16_t = opus::bf16_t;
+template <int N>
+using bvec = opus::vector_t<bf16_t, N>;
+
 // Same expression as the forward epilogue, so the backward differentiates the forward's
 // own rounding of the gate.
 __device__ inline float sigmoid(float g)
 {
     constexpr float LOG2_E = 1.44269504089f;
     return __builtin_amdgcn_rcpf(1.0f + __builtin_amdgcn_exp2f(-LOG2_E * g));
+}
+
+// Transposed operand reads for 16x16x32 MFMAs from a row-major LDS tile whose rows run
+// along the GEMM's K. ds_read_b64_tr_b16: each 16-lane group addresses a 4 x 16 block (lane
+// i: row i / 4, columns 4 (i % 4) .. + 3) and lane i receives column i, 4 rows deep.
+// These use the compiler builtin, not opus' inline-asm smem::tr_load: the compiler cannot see
+// inline-asm LDS reads, so it neither waits for them nor keeps them under the 15 outstanding
+// LDS operations lgkmcnt can count.
+using u32x2_t = opus::vector_t<opus::u32_t, 2>;
+using i16x4_t = opus::vector_t<short, 4>;
+
+__device__ inline u32x2_t tr_read(opus::smem<bf16_t>& s, int elem_off)
+{
+    return __builtin_bit_cast(
+        u32x2_t,
+        __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+            reinterpret_cast<OPUS_LDS_ADDR i16x4_t*>(s.ptr + elem_off * static_cast<int>(sizeof(bf16_t)))));
+}
+
+template <int N>
+__device__ inline bvec<N * 4> concat_tr_loads(const u32x2_t (&raw)[N])
+{
+    opus::vector_t<opus::u32_t, N * 2> r;
+#pragma unroll
+    for(int x = 0; x < N; x++)
+    {
+        r[2 * x]     = raw[x][0];
+        r[2 * x + 1] = raw[x][1];
+    }
+    return __builtin_bit_cast(bvec<N * 4>, r);
+}
+
+// B fragments (N-tiles of 16 columns, K = 32 rows) in the K order of a swap_ab C fragment
+// reused as the A operand: slot 4 h + e of lane group g is row 16 h + 4 g + e.
+template <int NT, int LD>
+__device__ inline bvec<NT * 8> tr_load_b_c_order(opus::smem<bf16_t>& s, int lane)
+{
+    const int g = lane / 16, i = lane % 16;
+    const int base = (g * 4 + i / 4) * LD + (i % 4) * 4;
+    u32x2_t raw[NT * 2];
+#pragma unroll
+    for(int tn = 0; tn < NT; tn++)
+#pragma unroll
+        for(int hh = 0; hh < 2; hh++)
+            raw[tn * 2 + hh] = tr_read(s, base + hh * 16 * LD + tn * 16);
+    return concat_tr_loads(raw);
+}
+
+// A or B fragments in the MFMA's own K order (slot j of lane group g is row 8 g + j) over
+// NKS steps of 32 rows, for NT tiles of 16 columns starting at col0.
+template <int NT, int NKS, int LD>
+__device__ inline bvec<NT * NKS * 8> tr_load_std(opus::smem<bf16_t>& s, int lane, int col0)
+{
+    const int g = lane / 16, i = lane % 16;
+    const int base = (g * 8 + i / 4) * LD + col0 + (i % 4) * 4;
+    u32x2_t raw[NT * NKS * 2];
+#pragma unroll
+    for(int tn = 0; tn < NT; tn++)
+#pragma unroll
+        for(int ks = 0; ks < NKS; ks++)
+#pragma unroll
+            for(int hh = 0; hh < 2; hh++)
+                raw[(tn * NKS + ks) * 2 + hh] = tr_read(s, base + (ks * 32 + hh * 4) * LD + tn * 16);
+    return concat_tr_loads(raw);
 }
 
 } // namespace gated_mla_bwd
@@ -76,15 +144,16 @@ gated_mla_bwd_pre_kernel(gated_mla_bwd_pre_kargs k)
         k.ptr_d[static_cast<long long>(h) * k.stride_d_h + t] = acc;
 }
 
-// Every GEMM is per wave with 16x16x32 bf16 MFMAs, C = A * B^T. P^T, dS^T and dS go through
-// LDS between GEMMs, and Q^T, dO^T and K^T are kept as transposed LDS copies, so each
-// operand is read in its natural layout.
+// Every GEMM is per wave with 16x16x32 bf16 MFMAs, C = A * B^T. P^T and dS^T stay in
+// registers as the A operand of dV and dK; their B operands (dO^T, Q^T) are transposed reads
+// of the natural Q and dO tiles. dS^T is the one tile that goes through LDS, since dQ sums it
+// over all 128 keys of the workgroup. The next query tile is fetched into registers during
+// the current one and staged into the other LDS buffer, so each tile has one barrier.
 __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(gated_mla_bwd_kargs k)
 {
     using namespace gated_mla_bwd;
     using opus::operator""_I;
-    using bf16_t = opus::bf16_t;
-    using vec8_t = opus::vector_t<bf16_t, 8>;
+    using vec8_t = bvec<8>;
     constexpr float LOG2_E = 1.44269504089f;
     __shared__ __attribute__((aligned(16))) bf16_t smem[SMEM_ELEMS];
 
@@ -124,7 +193,12 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
     auto mma_dv  = make_mma(opus::number<D_V / 16>{}, opus::number<BQ / 32>{});    // dV   [16 x 128]
     auto mma_dk  = make_mma(opus::number<D_QK / 16>{}, opus::number<BQ / 32>{});   // dK   [16 x 192]
     auto mma_dkr = make_mma(opus::number<D_ROT / 16>{}, opus::number<BQ / 32>{});  // C of dK, rope part
-    auto mma_dq  = make_mma(opus::number<DQ_N / 16>{}, opus::number<BK / 32>{});   // dQ   [16 x 48]
+    // dQ^T [48 x 16] = K^T dS^T: lanes run along d, so each atomic instruction covers
+    // contiguous dq_acc rows instead of 16 scattered ones.
+    auto mma_dq = opus::make_tiled_mma<bf16_t, bf16_t, float>(
+        opus::seq<DQ_N / 16, 1, BK / 32>{}, opus::seq<1, 1, 1>{}, opus::seq<16, 16, 32>{},
+        opus::mfma_adaptor_swap_ab{});
+    static_assert(BQ == 32, "the C -> A reuse of P^T / dS^T needs the query tile to be one K step");
     const auto c_ab = opus::make_tuple(0_I, lane % mma_s.grpm_a, 0_I, lane / mma_s.grpm_a);
     const auto c_c  = opus::make_tuple(0_I, lane % mma_s.grpn_c, 0_I, lane / mma_s.grpn_c);
 
@@ -158,7 +232,7 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
     for(int e = 0; e < KR_LEN; e++)
         v_kw[KN_LEN + e] = v_kr[e];
 
-    // K^T of the whole block, the B operand of dQ = dS K.
+    // The whole key block in its natural layout; dQ reads it transposed as K^T.
     for(int c = tid; c < BK * D_QK / 8; c += BLOCK)
     {
         const int r = c / (D_QK / 8), c8 = (c % (D_QK / 8)) * 8, kv = kv0 + r;
@@ -171,114 +245,130 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         else
             for(int e = 0; e < 8; e++)
                 v[e] = bf16_t(0.0f);
-        for(int e = 0; e < 8; e++)
-            smem[OFF_KT + (c8 + e) * LD_KV + r] = v[e];
+        *reinterpret_cast<vec8_t*>(smem + OFF_K + r * LD_K + c8) = v;
     }
 
-    auto s_q     = opus::make_smem(smem + OFF_Q);
-    auto s_qt    = opus::make_smem(smem + OFF_QT);
-    auto s_do    = opus::make_smem(smem + OFF_DO);
-    auto s_dot   = opus::make_smem(smem + OFF_DOT);
-    auto s_pt_w  = opus::make_smem(smem + OFF_PT + w * WR * LD_T);
-    auto s_dst_w = opus::make_smem(smem + OFF_DST + w * WR * LD_T);
-    auto s_ds_w  = opus::make_smem(smem + OFF_DS + w * WR);
-    auto s_ds_q  = opus::make_smem(smem + OFF_DS + (w / 4) * 16 * LD_KV);
-    auto s_kt_q  = opus::make_smem(smem + OFF_KT + (w % 4) * DQ_N * LD_KV);
+    // Query tiles go global -> registers -> LDS one tile ahead; rows past seqlen_q are 0.
+    constexpr int QC = BQ * D_QK / 8, QR = (QC + BLOCK - 1) / BLOCK;
+    static_assert(BQ * D_V / 8 == BLOCK, "one dO chunk per thread");
+    const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q);
+    const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do);
+    vec8_t r_q[QR], r_do;
+    auto fetch = [&](int i) {
+        const int qt0 = i * BQ;
+#pragma unroll
+        for(int u = 0; u < QR; u++)
+        {
+            const int c = tid + u * BLOCK, r = c / (D_QK / 8), c8 = (c % (D_QK / 8)) * 8;
+            if(c < QC && qt0 + r < seqlen_q)
+                r_q[u] = *reinterpret_cast<const vec8_t*>(q_ptr + static_cast<long long>(q0 + qt0 + r) * k.stride_q_n +
+                                                          static_cast<long long>(h) * k.stride_q_h + c8);
+            else
+                for(int e = 0; e < 8; e++)
+                    r_q[u][e] = bf16_t(0.0f);
+        }
+        const int r = tid / (D_V / 8), c8 = (tid % (D_V / 8)) * 8;
+        if(qt0 + r < seqlen_q)
+            r_do = *reinterpret_cast<const vec8_t*>(do_ptr + static_cast<long long>(q0 + qt0 + r) * k.stride_do_n +
+                                                    static_cast<long long>(h) * k.stride_do_h + c8);
+        else
+            for(int e = 0; e < 8; e++)
+                r_do[e] = bf16_t(0.0f);
+    };
+    auto stage = [&](int buf) {
+#pragma unroll
+        for(int u = 0; u < QR; u++)
+        {
+            const int c = tid + u * BLOCK, r = c / (D_QK / 8), c8 = (c % (D_QK / 8)) * 8;
+            if(c < QC)
+                *reinterpret_cast<vec8_t*>(smem + OFF_Q + buf * BQ * LD_Q + r * LD_Q + c8) = r_q[u];
+        }
+        const int r = tid / (D_V / 8), c8 = (tid % (D_V / 8)) * 8;
+        *reinterpret_cast<vec8_t*>(smem + OFF_DO + buf * BQ * LD_DO + r * LD_DO + c8) = r_do;
+    };
 
-    const auto u_q    = opus::partition_layout_b<8>(mma_s, opus::make_tuple(opus::number<LD_Q>{}, 1_I), c_ab);
-    const auto u_do   = opus::partition_layout_b<8>(mma_dp, opus::make_tuple(opus::number<LD_DO>{}, 1_I), c_ab);
-    const auto u_ct   = opus::partition_layout_c(mma_s, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_c);
-    const auto u_ctt  = opus::partition_layout_c(mma_s, opus::make_tuple(1_I, opus::number<LD_KV>{}), c_c);
-    const auto u_a_dv = opus::partition_layout_a<8>(mma_dv, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_ab);
-    const auto u_a_dk = opus::partition_layout_a<8>(mma_dk, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_ab);
-    const auto u_b_dv = opus::partition_layout_b<8>(mma_dv, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_ab);
-    const auto u_b_dk = opus::partition_layout_b<8>(mma_dk, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_ab);
-    const auto u_a_dq = opus::partition_layout_a<8>(mma_dq, opus::make_tuple(opus::number<LD_KV>{}, 1_I), c_ab);
-    const auto u_b_dq = opus::partition_layout_b<8>(mma_dq, opus::make_tuple(opus::number<LD_KV>{}, 1_I), c_ab);
-    // (row, col) of each C element, encoded as row * 256 + col.
-    const auto pos_s  = opus::layout_to_offsets<1>(
+    opus::smem<bf16_t> s_q[2]     = {opus::make_smem(smem + OFF_Q), opus::make_smem(smem + OFF_Q + BQ * LD_Q)};
+    opus::smem<bf16_t> s_do[2]    = {opus::make_smem(smem + OFF_DO), opus::make_smem(smem + OFF_DO + BQ * LD_DO)};
+    opus::smem<bf16_t> s_dst[2]   = {opus::make_smem(smem + OFF_DST), opus::make_smem(smem + OFF_DST + BK * LD_T)};
+    opus::smem<bf16_t> s_dst_w[2] = {opus::make_smem(smem + OFF_DST + w * WR * LD_T),
+                                     opus::make_smem(smem + OFF_DST + BK * LD_T + w * WR * LD_T)};
+    auto s_k                      = opus::make_smem(smem + OFF_K);
+
+    const auto u_q  = opus::partition_layout_b<8>(mma_s, opus::make_tuple(opus::number<LD_Q>{}, 1_I), c_ab);
+    const auto u_do = opus::partition_layout_b<8>(mma_dp, opus::make_tuple(opus::number<LD_DO>{}, 1_I), c_ab);
+    const auto u_ct = opus::partition_layout_c(mma_s, opus::make_tuple(opus::number<LD_T>{}, 1_I), c_c);
+    // (row, col) of each C element of S^T, encoded as row * 256 + col.
+    const auto pos_s = opus::layout_to_offsets<1>(
         opus::partition_layout_c(mma_s, opus::make_tuple(opus::number<256>{}, 1_I), c_c));
-    const auto pos_dq = opus::layout_to_offsets<1>(
-        opus::partition_layout_c(mma_dq, opus::make_tuple(opus::number<256>{}, 1_I), c_c));
+    // dQ: this wave's 48 dims x 16 queries of the tile, query rows from dq_base.
+    float* dq_base  = k.ptr_dq_acc + static_cast<long long>(q0) * k.stride_dq_n +
+                     static_cast<long long>(h) * k.stride_dq_h + (w % 4) * DQ_N;
+    const auto u_dq = opus::partition_layout_c(mma_dq, opus::make_tuple(1_I, k.stride_dq_n), c_c);
 
     typename decltype(mma_dv)::vtype_c v_dv;
     typename decltype(mma_dk)::vtype_c v_dk;
     opus::clear(v_dv);
     opus::clear(v_dk);
     const float scale_log2 = k.softmax_scale * LOG2_E;
-    const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q);
-    const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do);
+
+    if(i_begin < n_q_tiles)
+    {
+        fetch(i_begin);
+        stage(0);
+        if(i_begin + 1 < n_q_tiles)
+            fetch(i_begin + 1);
+    }
+    __syncthreads();
 
     for(int i = i_begin; i < n_q_tiles; i++)
     {
+        const int b   = (i - i_begin) & 1;
         const int qt0 = i * BQ;
-        __syncthreads();
-        for(int c = tid; c < BQ * D_QK / 8; c += BLOCK)
+        constexpr int NS = decltype(mma_s)::tile_c_len;
+        float lse_e[NS], d_e[NS];
+#pragma unroll
+        for(int e = 0; e < NS; e++)
         {
-            const int r = c / (D_QK / 8), c8 = (c % (D_QK / 8)) * 8;
-            vec8_t v;
-            if(qt0 + r < seqlen_q)
-                v = *reinterpret_cast<const vec8_t*>(q_ptr + static_cast<long long>(q0 + qt0 + r) * k.stride_q_n +
-                                                     static_cast<long long>(h) * k.stride_q_h + c8);
-            else
-                for(int e = 0; e < 8; e++)
-                    v[e] = bf16_t(0.0f);
-            *reinterpret_cast<vec8_t*>(smem + OFF_Q + r * LD_Q + c8) = v;
-            for(int e = 0; e < 8; e++)
-                smem[OFF_QT + (c8 + e) * LD_T + r] = v[e];
+            const int qp       = qt0 + pos_s[e] % 256;
+            const long long li = static_cast<long long>(h) * k.stride_lse_h + q0 +
+                                 (qp < seqlen_q ? qp : seqlen_q - 1);
+            lse_e[e] = k.ptr_lse[li] * LOG2_E;
+            d_e[e]   = k.ptr_d[li];
         }
-        for(int c = tid; c < BQ * D_V / 8; c += BLOCK)
-        {
-            const int r = c / (D_V / 8), c8 = (c % (D_V / 8)) * 8;
-            vec8_t v;
-            if(qt0 + r < seqlen_q)
-                v = *reinterpret_cast<const vec8_t*>(do_ptr + static_cast<long long>(q0 + qt0 + r) * k.stride_do_n +
-                                                     static_cast<long long>(h) * k.stride_do_h + c8);
-            else
-                for(int e = 0; e < 8; e++)
-                    v[e] = bf16_t(0.0f);
-            *reinterpret_cast<vec8_t*>(smem + OFF_DO + r * LD_DO + c8) = v;
-            for(int e = 0; e < 8; e++)
-                smem[OFF_DOT + (c8 + e) * LD_T + r] = v[e];
-        }
-        __syncthreads();
 
-        auto v_st  = mma_s(v_kw, s_q.template load<8>(u_q));
-        auto v_dpt = mma_dp(v_vw, s_do.template load<8>(u_do));
-        constexpr int NS = opus::vector_traits<decltype(v_st)>::size();
+        const auto v_st  = mma_s(v_kw, s_q[b].template load<8>(u_q));
+        const auto v_dpt = mma_dp(v_vw, s_do[b].template load<8>(u_do));
         opus::vector_t<float, NS> v_p, v_ds;
+#pragma unroll
         for(int e = 0; e < NS; e++)
         {
             const int kv = row_w + pos_s[e] / 256, qp = qt0 + pos_s[e] % 256;
             const bool ok = kv < seqlen_k && qp < seqlen_q && (!k.causal || qp + causal_offset >= kv);
-            float p = 0.0f, ds = 0.0f;
-            if(ok)
-            {
-                const long long li = static_cast<long long>(h) * k.stride_lse_h + q0 + qp;
-                p  = __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - k.ptr_lse[li] * LOG2_E);
-                ds = p * (v_dpt[e] - k.ptr_d[li]) * k.softmax_scale;
-            }
+            const float p = ok ? __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - lse_e[e]) : 0.0f;
             v_p[e]  = p;
-            v_ds[e] = ds;
+            v_ds[e] = p * (v_dpt[e] - d_e[e]) * k.softmax_scale;
         }
-        const auto v_ds_bf = opus::cast<bf16_t>(v_ds);
-        s_pt_w.template store<4>(opus::cast<bf16_t>(v_p), u_ct);
-        s_dst_w.template store<4>(v_ds_bf, u_ct);
-        s_ds_w.template store<1>(v_ds_bf, u_ctt);
+        // C -> A: the K order of these fragments is what tr_load_b_c_order supplies.
+        const auto a_p  = opus::cast<bf16_t>(v_p);
+        const auto a_ds = opus::cast<bf16_t>(v_ds);
+        v_dv = mma_dv(a_p, tr_load_b_c_order<D_V / 16, LD_DO>(s_do[b], lane), v_dv);
+        v_dk = mma_dk(a_ds, tr_load_b_c_order<D_QK / 16, LD_Q>(s_q[b], lane), v_dk);
+        s_dst_w[b].template store<4>(a_ds, u_ct);
+
+        if(i + 1 < n_q_tiles)
+            stage(b ^ 1);
+        if(i + 2 < n_q_tiles)
+            fetch(i + 2);
         __syncthreads();
 
-        v_dv = mma_dv(s_pt_w.template load<8>(u_a_dv), s_dot.template load<8>(u_b_dv), v_dv);
-        v_dk = mma_dk(s_dst_w.template load<8>(u_a_dk), s_qt.template load<8>(u_b_dk), v_dk);
-        auto v_dq = mma_dq(s_ds_q.template load<8>(u_a_dq), s_kt_q.template load<8>(u_b_dq));
-        constexpr int NDQ = opus::vector_traits<decltype(v_dq)>::size();
-        for(int e = 0; e < NDQ; e++)
-        {
-            const int qp = qt0 + (w / 4) * 16 + pos_dq[e] / 256;
-            if(qp < seqlen_q)
-                unsafeAtomicAdd(k.ptr_dq_acc + static_cast<long long>(q0 + qp) * k.stride_dq_n +
-                                    static_cast<long long>(h) * k.stride_dq_h + (w % 4) * DQ_N + pos_dq[e] % 256,
-                                v_dq[e]);
-        }
+        const auto v_dq = mma_dq(tr_load_std<DQ_N / 16, BK / 32, LD_K>(s_k, lane, (w % 4) * DQ_N),
+                                 tr_load_std<1, BK / 32, LD_T>(s_dst[b], lane, (w / 4) * 16));
+        // Buffer atomics bounded to this wave's valid query rows: rows past seqlen_q are
+        // dropped by the descriptor instead of a branch per element.
+        const int dq_row = qt0 + (w / 4) * 16;
+        auto g_dq        = opus::make_gmem(dq_base + static_cast<long long>(dq_row) * k.stride_dq_n,
+                                    rec(static_cast<long long>(seqlen_q - dq_row) * k.stride_dq_n, 4));
+        g_dq.template atomic_add<1>(v_dq, u_dq);
     }
 
     // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32; rows past seqlen_k
@@ -293,7 +383,7 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
                                  rec(static_cast<long long>(rows_w) * k.stride_dkr_n, 4));
     const auto u_dkv = opus::partition_layout_c(mma_dv, opus::make_tuple(k.stride_dkv_n, 1_I), c_c);
     const auto u_dkr = opus::partition_layout_c(mma_dkr, opus::make_tuple(k.stride_dkr_n, 1_I), c_c);
-    constexpr int DK_LEN  = opus::vector_traits<decltype(v_dk)>::size();
+    constexpr int DK_LEN  = decltype(mma_dk)::tile_c_len;
     constexpr int DKN_LEN = DK_LEN * D_NOPE / D_QK;
     g_dkn.template store<4>(opus::cast<bf16_t>(opus::slice(v_dk, opus::number<0>{}, opus::number<DKN_LEN>{})), u_dkv);
     g_dv.template store<4>(opus::cast<bf16_t>(v_dv), u_dkv);

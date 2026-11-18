@@ -71,19 +71,16 @@ constexpr int BQ = 32;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
 
-// LDS, bf16 elements. Row strides carry 8 elements of padding.
-constexpr int LD_Q  = D_QK + 8;  // sQ   [BQ][D_QK]   B of S^T
-constexpr int LD_T  = BQ + 8;    // sQT  [D_QK][BQ]   B of dK;  sDOT [D_V][BQ] B of dV
-                                 // sPT, sDST [BK][BQ] A of dV, dK
-constexpr int LD_DO = D_V + 8;   // sDO  [BQ][D_V]    B of dP^T
-constexpr int LD_KV = BK + 8;    // sDS  [BQ][BK]     A of dQ;  sKT [D_QK][BK] B of dQ
+// LDS, bf16 elements, all row-major with 8 elements of row padding. Transposed operands
+// are read with ds_read_b64_tr_b16, so no tile is stored twice. sQ, sDO and sDST are
+// double-buffered by query-tile parity, which leaves one barrier per tile.
+constexpr int LD_Q  = D_QK + 8;  // sQ  [BQ][D_QK]  B of S^T; B of dK (transposed)
+constexpr int LD_DO = D_V + 8;   // sDO [BQ][D_V]   B of dP^T; B of dV (transposed)
+constexpr int LD_T  = BQ + 8;    // sDST [BK][BQ]   A of dQ (transposed)
+constexpr int LD_K  = D_QK + 8;  // sK  [BK][D_QK]  B of dQ (transposed)
 constexpr int OFF_Q   = 0;
-constexpr int OFF_QT  = OFF_Q + BQ * LD_Q;
-constexpr int OFF_DO  = OFF_QT + D_QK * LD_T;
-constexpr int OFF_DOT = OFF_DO + BQ * LD_DO;
-constexpr int OFF_PT  = OFF_DOT + D_V * LD_T;
-constexpr int OFF_DST = OFF_PT + BK * LD_T;
-constexpr int OFF_DS  = OFF_DST + BK * LD_T;
-constexpr int OFF_KT  = OFF_DS + BQ * LD_KV;
-constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KV;
+constexpr int OFF_DO  = OFF_Q + 2 * BQ * LD_Q;
+constexpr int OFF_DST = OFF_DO + 2 * BQ * LD_DO;
+constexpr int OFF_K   = OFF_DST + 2 * BK * LD_T;
+constexpr int SMEM_ELEMS = OFF_K + BK * LD_K;
 } // namespace gated_mla_bwd
