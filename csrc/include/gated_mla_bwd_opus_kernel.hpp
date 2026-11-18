@@ -354,7 +354,8 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         {
             const int kv = row_w + pos_s[e] / 256, qp = qt0 + pos_s[e] % 256;
             const bool ok = kv < seqlen_k && qp < seqlen_q && (!k.causal || qp + causal_offset >= kv);
-            const float p = ok ? __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - lse_e[e]) : 0.0f;
+            // Select the exponent, not the result, so the exp needs no branch.
+            const float p = __builtin_amdgcn_exp2f(ok ? v_st[e] * scale_log2 - lse_e[e] : -1e30f);
             v_p[e]  = p;
             v_ds[e] = p * (v_dpt[e] - d_e[e]) * k.softmax_scale;
         }
