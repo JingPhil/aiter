@@ -65,22 +65,25 @@ struct gated_mla_bwd_kargs {
 
 namespace gated_mla_bwd {
 constexpr int BK = 128;  // keys per workgroup
-constexpr int NW = 8;    // waves; wave w owns keys [16 w, 16 w + 16)
-constexpr int WR = BK / NW;
+constexpr int NW = 8;    // waves
+constexpr int NP = 4;    // wave pairs (w, w + 4), one per SIMD; pair p owns keys [32 p, 32 p + 32)
+constexpr int PR = BK / NP;
 constexpr int BQ = 32;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
+constexpr int DQ_M = D_QK / NP;  // dQ: each S wave owns 48 dims of the tile
 constexpr int BLOCK = NW * 64;
 
-// LDS, bf16 elements, all row-major with 8 elements of row padding. Transposed operands
-// are read with ds_read_b64_tr_b16, so no tile is stored twice. sQ, sDO and sDST are
-// double-buffered by query-tile parity, which leaves one barrier per tile.
+// LDS, bf16 elements, all row-major with 8 elements of row padding. Per-tile operands are
+// stored once and read transposed with ds_read_b64_tr_b16 where needed; the key block, staged
+// once per workgroup, is stored as K^T. sQ, sDO and sDST are double-buffered by query-tile
+// parity.
 constexpr int LD_Q  = D_QK + 8;  // sQ  [BQ][D_QK]  B of S^T; B of dK (transposed)
 constexpr int LD_DO = D_V + 8;   // sDO [BQ][D_V]   B of dP^T; B of dV (transposed)
-constexpr int LD_T  = BQ + 8;    // sDST [BK][BQ]   A of dQ (transposed)
-constexpr int LD_K  = D_QK + 8;  // sK  [BK][D_QK]  B of dQ (transposed)
+constexpr int LD_T  = BQ + 8;    // sDST [BK][BQ]   B of dQ^T (transposed)
+constexpr int LD_KT = BK + 8;    // sKT [D_QK][BK]  A of dQ^T
 constexpr int OFF_Q   = 0;
 constexpr int OFF_DO  = OFF_Q + 2 * BQ * LD_Q;
 constexpr int OFF_DST = OFF_DO + 2 * BQ * LD_DO;
-constexpr int OFF_K   = OFF_DST + 2 * BK * LD_T;
-constexpr int SMEM_ELEMS = OFF_K + BK * LD_K;
+constexpr int OFF_KT  = OFF_DST + 2 * BK * LD_T;
+constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KT;
 } // namespace gated_mla_bwd
