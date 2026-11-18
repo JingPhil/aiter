@@ -24,7 +24,12 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.gated_mla_train import _gated_mla_fwd, gated_mla_train
+from aiter.ops.gated_mla_train import (
+    _gated_mla_bwd,
+    _gated_mla_bwd_pre,
+    _gated_mla_fwd,
+    gated_mla_train,
+)
 from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 
 HIDDEN = 7168
@@ -258,6 +263,54 @@ def test_gated_mla_fwd_reference(seqlens, causal):
     ref_out, ref_lse = _ref_attention(q, *_expanded_kv(kv, k_rot), gate, cu, causal)
     torch.testing.assert_close(out.float(), ref_out, atol=FWD_ATOL, rtol=FWD_RTOL)
     torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("seqlens", _FWD_SEQLENS, ids=_FWD_IDS)
+def test_gated_mla_bwd_pre(seqlens):
+    """Backward pre-pass against the gate formulas in fp32: dO and dgate within one bf16
+    rounding, D = rowsum(dout * out) up to fp32 summation order."""
+    _, _, q, _, _, gate = _fwd_inputs(seqlens)
+    t = q.shape[0]
+    out = torch.randn(t, HEADS, D_V, device="cuda", dtype=torch.bfloat16)
+    dout = torch.randn(t, HEADS * D_V, device="cuda", dtype=torch.bfloat16)
+    d_o, dgate, d = _gated_mla_bwd_pre(dout, out, gate)
+    s = gate.float().view(out.shape).sigmoid()
+    dout_f, out_f = dout.float().view(out.shape), out.float()
+    torch.testing.assert_close(d_o.float(), dout_f * s, atol=1e-6, rtol=1e-2)
+    torch.testing.assert_close(
+        dgate.float(), dout_f * out_f * (1 - s), atol=1e-6, rtol=1e-2
+    )
+    torch.testing.assert_close(d, (dout_f * out_f).sum(-1).t(), atol=1e-4, rtol=1e-5)
+
+
+def _ref_bwd(q, kv, k_rot, gate, dout, cu, causal):
+    """fp32 autograd of the gated attention: d(q), d(kv), d(k_rot), d(gate)."""
+    qf, kvf, krf, gf = (
+        x.detach().float().requires_grad_() for x in (q, kv, k_rot, gate)
+    )
+    k = torch.cat([kvf[..., :D_NOPE], krf.unsqueeze(1).expand(-1, HEADS, D_ROT)], -1)
+    out, _ = _ref_attention(qf, k, kvf[..., D_NOPE:], gf, cu, causal)
+    out.backward(dout.float().view(out.shape))
+    return qf.grad, kvf.grad, krf.grad, gf.grad
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("seqlens", _FWD_SEQLENS, ids=_FWD_IDS)
+def test_gated_mla_bwd_kernel(seqlens, causal):
+    """Backward kernels (pre-pass + main pass) against fp32 autograd, given the fused
+    forward's bf16 output and LSE: dq, d(kv) as [dk_nope | dv], dk_rot and dgate."""
+    cu, smax, q, kv, k_rot, gate = _fwd_inputs(seqlens)
+    out, lse = _gated_mla_fwd(q, kv, k_rot, gate, cu, smax, SCALE, causal, True)
+    dout = torch.randn(q.shape[0], HEADS * D_V, device="cuda", dtype=q.dtype)
+    ours = _gated_mla_bwd(q, kv, k_rot, gate, out, lse, dout, cu, smax, SCALE, causal)
+    ref = _ref_bwd(q, kv, k_rot, gate, dout, cu, causal)
+    failed = []
+    for name, a, r in zip(("dq", "dkv", "dk_rot", "dgate"), ours, ref):
+        err = _rel_err(a.reshape(r.shape), r)
+        print(f"  {name:7s} rel_err {err:.3e}")
+        if err > PARITY_REL_L2:
+            failed.append(name)
+    assert not failed, f"relative L2 error above {PARITY_REL_L2}: {failed}"
 
 
 if __name__ == "__main__":

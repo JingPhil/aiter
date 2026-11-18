@@ -1640,6 +1640,33 @@ namespace py = pybind11;
           py::arg("causal"),                          \
           py::arg("softmax_scale"));
 
+#define GATED_MLA_BWD_OPUS_PYBIND                     \
+    m.def("gated_mla_bwd_pre_bf16_opus",              \
+          &gated_mla_bwd_pre_bf16_opus,               \
+          py::arg("dout"),                            \
+          py::arg("out"),                             \
+          py::arg("gate"),                            \
+          py::arg("d_o"),                             \
+          py::arg("dgate"),                           \
+          py::arg("d"));                              \
+    m.def("gated_mla_bwd_bf16_opus",                  \
+          &gated_mla_bwd_bf16_opus,                   \
+          py::arg("q"),                               \
+          py::arg("k_nope"),                          \
+          py::arg("v"),                               \
+          py::arg("k_rot"),                           \
+          py::arg("d_o"),                             \
+          py::arg("lse"),                             \
+          py::arg("d"),                               \
+          py::arg("dq_acc"),                          \
+          py::arg("dkv"),                             \
+          py::arg("dk_rope"),                         \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"));
+
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
           &layernorm2d,                            \

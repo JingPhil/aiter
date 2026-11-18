@@ -19,6 +19,12 @@ The forward runs on the gfx950 OPUS D_QK=192 / D_V=128 kernel: it reads ``k_nope
 ``v`` straight out of the ``kv_b_proj`` output and ``k_rot`` from its own buffer, so K is
 never concatenated, and it applies the gate before the O store. Only ``kv_latent`` is kept
 for the backward, which recomputes the expansion.
+
+The backward is OPUS too. A pre-pass turns the gate into the attention's ``dO`` and the
+gate gradient, and forms ``D = rowsum(dout * out)``, which is the ungated attention's
+``rowsum(dO * O)`` without keeping the ungated output. The main pass reads K the way the
+forward does and writes ``[dk_nope | dv]`` in the ``kv_b_proj`` output layout, so the two
+``kv_b_proj`` GEMMs take it as is.
 """
 
 import torch
@@ -26,7 +32,6 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx
-from .mha import _flash_attn_varlen_backward
 
 
 def _gated_mla_fwd_bf16_opus_fake(
@@ -68,6 +73,129 @@ def _gated_mla_fwd_bf16_opus(
     causal: bool,
     softmax_scale: float,
 ) -> None: ...
+
+
+def _gated_mla_bwd_pre_bf16_opus_fake(
+    dout: Tensor, out: Tensor, gate: Tensor, d_o: Tensor, dgate: Tensor, d: Tensor
+) -> None:
+    return None
+
+
+# Writes `d_o`, `dgate` and `d` in place.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_pre_bf16_opus",
+    gen_fake=_gated_mla_bwd_pre_bf16_opus_fake,
+)
+def _gated_mla_bwd_pre_bf16_opus(
+    dout: Tensor, out: Tensor, gate: Tensor, d_o: Tensor, dgate: Tensor, d: Tensor
+) -> None: ...
+
+
+def _gated_mla_bwd_pre(
+    dout: Tensor, out: Tensor, gate: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Backward pre-pass on ``[T, H, d_v]`` rows: ``(dO, dgate, D)``.
+
+    ``dO = dout * sigmoid(gate)`` and ``dgate = dout * out * (1 - sigmoid(gate))`` in
+    bf16; ``D = rowsum(dout * out)`` ``[H, T]`` fp32, the ``rowsum(dO * O)`` of the
+    ungated attention.
+    """
+    t, h, _ = out.shape
+    dout, gate = (_kernel_ready(x.reshape(out.shape)) for x in (dout, gate))
+    d_o, dgate = torch.empty_like(out), torch.empty_like(out)
+    d = torch.empty(h, t, dtype=torch.float32, device=out.device)
+    _gated_mla_bwd_pre_bf16_opus(dout, _kernel_ready(out), gate, d_o, dgate, d)
+    return d_o, dgate, d
+
+
+def _gated_mla_bwd_bf16_opus_fake(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq_acc: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None:
+    return None
+
+
+# Adds into `dq_acc`, writes `dkv` and `dk_rope` in place.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_bf16_opus",
+    gen_fake=_gated_mla_bwd_bf16_opus_fake,
+)
+def _gated_mla_bwd_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq_acc: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
+def _gated_mla_bwd(
+    q: Tensor,
+    kv: Tensor,
+    k_rot: Tensor,
+    gate: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    dout: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Attention and gate gradients on the expanded ``kv`` ``[T, H, d_nope + d_v]``.
+
+    Returns ``dq [T, H, 192]``, ``dkv [T, H, 256]`` (each head's row ``[dk_nope | dv]``,
+    the ``kv_b_proj`` output layout), ``dk_rot [T, 64]`` and ``dgate [T, H, 128]``.
+    """
+    t, h, _ = q.shape
+    d_nope = q.shape[-1] - k_rot.shape[-1]
+    d_o, dgate, d = _gated_mla_bwd_pre(dout, out, gate)
+    dq_acc = torch.zeros(t, h, q.shape[-1], dtype=torch.float32, device=q.device)
+    dkv = torch.empty(t, h, kv.shape[-1], dtype=q.dtype, device=q.device)
+    dk_rope = torch.empty(t, h, k_rot.shape[-1], dtype=torch.float32, device=q.device)
+    _gated_mla_bwd_bf16_opus(
+        _kernel_ready(q),
+        kv[..., :d_nope],
+        kv[..., d_nope:],
+        _kernel_ready(k_rot),
+        d_o,
+        lse,
+        d,
+        dq_acc,
+        dkv,
+        dk_rope,
+        cu_seqlens,
+        cu_seqlens,
+        int(max_seqlen),
+        bool(causal),
+        float(softmax_scale),
+    )
+    return dq_acc.to(q.dtype), dkv, dk_rope.sum(1).to(k_rot.dtype), dgate
 
 
 def _kernel_ready(x: Tensor) -> Tensor:
@@ -155,51 +283,24 @@ class _GatedMLA(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         q, kv_latent, k_rot, kv_b_weight, gate, out, lse, cu_seqlens = ctx.saved_tensors
-        t, h, d_qk = q.shape
-        d_rot = k_rot.shape[-1]
-        d_nope = d_qk - d_rot
+        t, h, _ = q.shape
         kv = torch.mm(kv_latent, kv_b_weight.t()).view(t, h, -1)
-        k_nope, v = kv.split([d_nope, kv.shape[-1] - d_nope], dim=-1)
-        k = torch.cat([k_nope, k_rot.unsqueeze(1).expand(t, h, d_rot)], dim=-1)
-        v = v.contiguous()
-
-        dout = dout.view(out.shape).float()
-        out_f = out.float()
-        s = torch.sigmoid(gate.reshape(out.shape).float())
-        dgate = (dout * out_f * (1.0 - s)).to(gate.dtype)
-        do = (dout * s).to(q.dtype)
-        # The CK backward forms D = rowsum(dO * O) from the (dO, O) it is given, so it gets
-        # O = out / sigmoid(gate): that keeps D = rowsum(dout * out) without saving the
-        # ungated O. Where the sigmoid underflows to 0, dO is 0 and O does not matter.
-        o = torch.where(s > 0, out_f / s, 0.0).to(q.dtype)
-
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        _flash_attn_varlen_backward(
-            do,
+        dq, dkv, dk_rot, dgate = _gated_mla_bwd(
             q,
-            k,
-            v,
-            o,
+            kv,
+            k_rot,
+            gate,
+            out,
             lse,
-            dq,
-            dk,
-            dv,
-            cu_seqlens,
+            dout,
             cu_seqlens,
             ctx.max_seqlen,
-            ctx.max_seqlen,
-            0.0,
             ctx.scale,
             ctx.causal,
-            -1,
-            -1,
-            None,
-            False,
         )
-        dkv = torch.cat([dk[..., :d_nope], dv], dim=-1).view(t, -1)
+        dkv = dkv.view(t, -1)
         d_latent = torch.mm(dkv, kv_b_weight)
         d_weight = torch.mm(dkv.t(), kv_latent)
-        dk_rot = dk[..., d_nope:].float().sum(1).to(k_rot.dtype)
         return (
             dq,
             d_latent,
