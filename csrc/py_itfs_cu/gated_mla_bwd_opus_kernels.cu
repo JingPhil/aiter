@@ -150,9 +150,13 @@ void gated_mla_bwd_bf16_opus(at::Tensor& q,
     a.causal         = causal ? 1 : 0;
     if(total_q == 0 || total_k == 0 || H == 0)
         return;
+    a.num_seqs    = B;
+    a.n_kv_blocks = (max_seqlen_k + BK - 1) / BK;
+    const long long n_wg = static_cast<long long>(HG) * a.n_kv_blocks * B * ((H + HG - 1) / HG);
+    TORCH_CHECK(n_wg <= 0x7fffffffLL, "too many workgroups");
 
     HipDeviceGuard guard(q.device().index());
-    gated_mla_bwd_kernel<<<dim3((max_seqlen_k + BK - 1) / BK, H, B),
+    gated_mla_bwd_kernel<<<dim3(static_cast<unsigned>(n_wg)),
                            dim3(BLOCK),
                            0,
                            at::hip::getCurrentHIPStream()>>>(a);

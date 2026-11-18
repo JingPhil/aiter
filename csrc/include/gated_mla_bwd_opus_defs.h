@@ -27,7 +27,7 @@ struct gated_mla_bwd_pre_kargs {
 
 static constexpr int GATED_MLA_BWD_PRE_BLOCK = 256;
 
-// Main pass, one workgroup per (KV block of 128 keys, head, sequence), group / varlen only.
+// Main pass, one workgroup per (KV block of 192 keys, sequence, head), group / varlen only.
 // Per query tile it recomputes S^T = K Q^T and dP^T = V dO^T, forms P and dS from the
 // forward's LSE and the pre-pass D, accumulates dK and dV in registers and adds its share of
 // dQ into dq_acc with fp32 atomics. K is read as the forward reads it: dims 0..127 from
@@ -50,6 +50,8 @@ struct gated_mla_bwd_kargs {
     const int* __restrict__ ptr_seqstart_q;
     const int* __restrict__ ptr_seqstart_k;
     int H;
+    int num_seqs;
+    int n_kv_blocks;  // per sequence, from max_seqlen_k
     int stride_q_n, stride_q_h;
     int stride_k_n, stride_k_h;
     int stride_v_n, stride_v_h;
@@ -64,14 +66,16 @@ struct gated_mla_bwd_kargs {
 };
 
 namespace gated_mla_bwd {
-constexpr int BK = 128;  // keys per workgroup
-constexpr int NW = 8;    // waves
-constexpr int NP = 4;    // wave pairs (w, w + 4), one per SIMD; pair p owns keys [32 p, 32 p + 32)
-constexpr int PR = BK / NP;
-constexpr int BQ = 32;   // queries per tile
+constexpr int BK = 192;  // keys per workgroup; fewer, larger blocks mean fewer dQ atomics
+constexpr int NW = 4;    // waves, one per SIMD; wave w owns keys [48 w, 48 w + 48)
+constexpr int WR = BK / NW;
+constexpr int BQ = 16;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
-constexpr int DQ_M = D_QK / NP;  // dQ: each S wave owns 48 dims of the tile
+constexpr int DQ_M = D_QK / NW;  // dQ: each wave owns 48 dims of the tile
 constexpr int BLOCK = NW * 64;
+// Heads per scheduling group, a multiple of the 8 XCDs that workgroups reach round-robin by
+// linear id; see the kernel's id map.
+constexpr int HG = 16;
 
 // LDS, bf16 elements, all row-major with 8 elements of row padding. Per-tile operands are
 // stored once and read transposed with ds_read_b64_tr_b16 where needed; the key block, staged
