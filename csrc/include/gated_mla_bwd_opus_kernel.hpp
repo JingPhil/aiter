@@ -715,6 +715,9 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
         typename decltype(mma_k1)::vtype_c acc;
         opus::clear(acc);
         auto b_cur = sm.template load<8>(u_b, 0);
+        // Priority 1 for the length of each MFMA run (here and in dQ below): the arbiter then
+        // favors the wave already issuing MFMAs over the other wave of the SIMD.
+        __builtin_amdgcn_s_setprio(1);
 #pragma unroll
         for(int ks = 0; ks < NKS; ks++)
         {
@@ -731,6 +734,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             __builtin_amdgcn_sched_barrier(0);
             b_cur = b_next;
         }
+        __builtin_amdgcn_s_setprio(0);
         return acc;
     };
     // C element e = (tm 2 + tn) 4 + p of S and dP is query 16 tm + lane % 16, key 16 tn +
@@ -790,6 +794,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
         const auto a_ds = opus::cast<bf16_t>(v_ds);
         auto b_dq       = [&](int c) { return tr_load_b_c_order<QC / 16, LD_K>(s_k(b), lane, c * QC); };
         auto b_cur      = b_dq(0);
+        __builtin_amdgcn_s_setprio(1);
 #pragma unroll
         for(int c = 0; c < NQC; c++)
         {
@@ -800,6 +805,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             __builtin_amdgcn_sched_barrier(0);
             b_cur = b_next;
         }
+        __builtin_amdgcn_s_setprio(0);
 
         if(t + 1 < n_kv_tiles)
             stage(b ^ 1);
