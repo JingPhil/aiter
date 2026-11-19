@@ -125,12 +125,17 @@ constexpr int BQ = 32;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
 constexpr int HG = 16;
-// LDS, bf16, double-buffered by query-tile parity: sQ [BQ][D_QK] (B of S^T; B of dK,
-// transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed). Rows padded by 16 elements:
-// with 8, both the B-fragment ds_read_b128 and the ds_read_b64_tr_b16 reads conflict 2-way.
+// LDS, in bf16 elements: NBUF query tiles, each sQ [BQ][D_QK] (B of S^T; B of dK, transposed),
+// sDO [BQ][D_V] (B of dP^T; B of dV, transposed) and the tile's LSE and D in fp32 (256 bytes
+// each, one DMA load). Rows padded by 16 elements: with 8, both the B-fragment ds_read_b128 and
+// the ds_read_b64_tr_b16 reads conflict 2-way. After them sP [NP][PR x BQ] in fp32: P from each
+// pair's S wave to its dP wave.
+constexpr int NBUF = 5;
 constexpr int LD_Q = D_QK + 16, LD_DO = D_V + 16;
-constexpr int OFF_Q = 0, OFF_DO = OFF_Q + 2 * BQ * LD_Q;
-constexpr int SMEM_ELEMS = OFF_DO + 2 * BQ * LD_DO;
+constexpr int OFF_Q = 0, OFF_DO = OFF_Q + BQ * LD_Q, OFF_LSE = OFF_DO + BQ * LD_DO, OFF_D = OFF_LSE + 128;
+constexpr int SZ_BUF     = OFF_D + 128;
+constexpr int OFF_P      = NBUF * SZ_BUF;
+constexpr int SMEM_ELEMS = OFF_P + NP * PR * BQ * 2;
 } // namespace gated_mla_bwd_pair
 
 // dQ pass without atomics, one workgroup per (query block of 256, sequence, head). Each wave
