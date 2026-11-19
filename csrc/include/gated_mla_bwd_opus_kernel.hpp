@@ -174,6 +174,29 @@ __device__ inline void acc_gemm32(f32x4_t (&acc)[MT][NT], const VA& a, const VB&
             mfma_acc_16x16x32(acc[m][n], frag8(a, m), frag8(b, n));
 }
 
+// Global -> LDS copy of 16 bytes per lane (buffer_load_dwordx4 ... lds): lane l's 16 bytes at
+// byte offset voff of the buffer (past its size: zeros) land at LDS byte lds + 16 l. Inline asm,
+// so the compiler neither sees the LDS write nor waits for it (it would wait before every LDS
+// read it cannot tell apart); the caller waits vmcnt before anyone reads the data, which
+// s_barrier alone does not do.
+using i32x4_t = opus::vector_t<int, 4>;
+__device__ inline i32x4_t dma_rsrc(const void* p, unsigned int bytes)
+{
+    const unsigned long long a = reinterpret_cast<unsigned long long>(p);
+    return i32x4_t{__builtin_amdgcn_readfirstlane(static_cast<int>(a)),
+                   __builtin_amdgcn_readfirstlane(static_cast<int>(a >> 32) & 0xffff),
+                   __builtin_amdgcn_readfirstlane(static_cast<int>(bytes)),
+                   0x00020000};
+}
+__device__ inline unsigned int lds_addr(const void* p)
+{
+    return static_cast<unsigned int>(reinterpret_cast<__UINTPTR_TYPE__>(p));
+}
+__device__ inline void dma16(const i32x4_t& rsrc, int voff, unsigned int lds)
+{
+    asm volatile("s_mov_b32 m0, %2\n\tbuffer_load_dwordx4 %0, %1, 0 offen lds" : : "v"(voff), "s"(rsrc), "s"(lds) : "m0");
+}
+
 } // namespace gated_mla_bwd
 
 // One row of D_V = 128 bf16 per 16 lanes (8 per lane, one 16-byte access each).
@@ -1165,7 +1188,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
 // three M tiles. GEMMs are per wave, C = A * B^T, all 16x16x32 MFMAs: S^T and dP^T over d; dV
 // and dK over the tile's 32 queries, with P^T and dS^T (the C fragments of S^T and dP^T, two N
 // tiles per M tile) as their A operands and transposed reads of the dO and Q tiles as B. Query
-// tiles go global -> registers -> LDS one tile ahead into the other buffer, one barrier per tile.
+// tiles go global -> LDS one tile ahead into the other buffer, one barrier per tile.
 __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv_4w_kernel(gated_mla_bwd_kargs k)
 {
     using namespace gated_mla_bwd_4w;
@@ -1223,6 +1246,7 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
     auto mma_kn = make_mma(number<MR>{}, number<NT>{}, number<D_NOPE / 32>{});  // A of S^T, nope part
     auto mma_kr = make_mma(number<MR>{}, number<NT>{}, number<D_ROT / 32>{});   // A of S^T, rope part
     auto mma_dp = make_mma(number<MR>{}, number<NT>{}, number<D_V / 32>{});     // dP^T [48 x 32]
+    auto mma1   = make_mma(number<1>{}, number<1>{}, number<1>{});
     const auto c_ab = opus::make_tuple(0_I, lane % mma_s.grpm_a, 0_I, lane / mma_s.grpm_a);
 
     auto rec = [](long long elems, int elem_bytes) -> unsigned int {
@@ -1265,50 +1289,66 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
                     v_kw[(m * KS + ks) * 8 + e] = v_kr[(m * KS_R + ks - KS_N) * 8 + e];
             }
 
-    // Query tiles, with their LSE and D, go global -> registers -> LDS one tile ahead. Thread t
-    // owns row t / 8 of the tile, 3 chunks of 8 columns of Q and 2 of dO from column 8 (t % 8),
-    // every 8th chunk; rows past seqlen_q fall outside the descriptors and read as 0. LSE comes
-    // through lanes 0 .. BQ - 1 of wave 0 and D through those of wave 1 (a per-wave base keeps
-    // the descriptor uniform).
-    constexpr int FC = 8, QR = D_QK / 8 / FC, DR = D_V / 8 / FC;
-    static_assert(BLOCK == BQ * FC, "one tile row per 8 threads");
-    const int f_row = tid / FC, f_c = (tid % FC) * 8;
-    const int vo_q = f_row * k.stride_q_n + f_c, vo_do = f_row * k.stride_do_n + f_c;
-    const int so_q = OFF_Q + f_row * LD_Q + f_c, so_do = OFF_DO + f_row * LD_DO + f_c;
+    // Q and dO tiles go global -> LDS directly (gated_mla_bwd::dma16), one tile ahead, so they take
+    // no staging registers. Each such load writes 64 lanes x 16 B contiguously from a wave-uniform
+    // LDS address, so load j of a tensor covers 16-byte slots 64 j .. + 63 of its tile laid out
+    // with the row padding: slot s of Q is row s / 26, chunk s % 26 (chunks 24, 25 are padding),
+    // of dO row s / 18, chunk s % 18 (16, 17 padding). Padding slots and rows past seqlen_q read
+    // out of bounds, as 0. Of a tile's 13 Q and 9 dO loads, wave w issues Q loads w, w + 4, w + 8
+    // and dO loads w, w + 4; wave 0 also Q load 12, wave 1 dO load 8.
+    constexpr int QS = LD_Q * 2 / 16, DS = LD_DO * 2 / 16;  // slots per padded row
+    static_assert(BQ * QS == 13 * 64 && BQ * DS == 9 * 64, "the load split below");
+    constexpr int OOB = 1 << 30;                            // byte offset past any tile
+    auto slot_os = [&](int j, int slots, int chunks, int row_bytes) {
+        const int sl = 64 * j + lane, c = sl % slots;
+        return c < chunks ? sl / slots * row_bytes + c * 16 : OOB;
+    };
+    int os_q[4], os_d[3];
+#pragma unroll
+    for(int u = 0; u < 3; u++)
+        os_q[u] = slot_os(w + 4 * u, QS, D_QK / 8, k.stride_q_n * 2);
+    os_q[3] = slot_os(12, QS, D_QK / 8, k.stride_q_n * 2);
+#pragma unroll
+    for(int u = 0; u < 2; u++)
+        os_d[u] = slot_os(w + 4 * u, DS, D_V / 8, k.stride_do_n * 2);
+    os_d[2] = slot_os(8, DS, D_V / 8, k.stride_do_n * 2);
     const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q) + static_cast<long long>(q0) * k.stride_q_n +
                           static_cast<long long>(h) * k.stride_q_h;
     const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(q0) * k.stride_do_n +
                            static_cast<long long>(h) * k.stride_do_h;
+    auto dma = [&](int i, int buf) {
+        const int qt0 = i * BQ;
+        const auto rq = gated_mla_bwd::dma_rsrc(q_ptr + static_cast<long long>(qt0) * k.stride_q_n,
+                                                rec_rows(seqlen_q - qt0, BQ, k.stride_q_n * 2));
+        const auto rd = gated_mla_bwd::dma_rsrc(do_ptr + static_cast<long long>(qt0) * k.stride_do_n,
+                                                rec_rows(seqlen_q - qt0, BQ, k.stride_do_n * 2));
+        const unsigned int lq = gated_mla_bwd::lds_addr(smem + OFF_Q + buf * BQ * LD_Q);
+        const unsigned int ld = gated_mla_bwd::lds_addr(smem + OFF_DO + buf * BQ * LD_DO);
+#pragma unroll
+        for(int u = 0; u < 3; u++)
+            gated_mla_bwd::dma16(rq, os_q[u], lq + (w + 4 * u) * 1024);
+#pragma unroll
+        for(int u = 0; u < 2; u++)
+            gated_mla_bwd::dma16(rd, os_d[u], ld + (w + 4 * u) * 1024);
+        if(w == 0)
+            gated_mla_bwd::dma16(rq, os_q[3], lq + 12 * 1024);
+        if(w == 1)
+            gated_mla_bwd::dma16(rd, os_d[2], ld + 8 * 1024);
+    };
     const bool f_ld     = w < 2 && lane < BQ;
     const int ld_slot   = (w == 0 ? 0 : BQ) + lane;
     const float* ld_ptr = (w == 0 ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h + q0;
-    vec8_t r_q[QR], r_do[DR];
     float r_ld = 0.0f;
-    auto fetch = [&](int i) {
-        const int qt0 = i * BQ;
-        auto g_q  = opus::make_gmem(q_ptr + static_cast<long long>(qt0) * k.stride_q_n,
-                                   rec_rows(seqlen_q - qt0, BQ, k.stride_q_n * 2));
-        auto g_do = opus::make_gmem(do_ptr + static_cast<long long>(qt0) * k.stride_do_n,
-                                    rec_rows(seqlen_q - qt0, BQ, k.stride_do_n * 2));
-#pragma unroll
-        for(int u = 0; u < QR; u++)
-            r_q[u] = g_q.template load<8>(vo_q + u * FC * 8);
-#pragma unroll
-        for(int u = 0; u < DR; u++)
-            r_do[u] = g_do.template load<8>(vo_do + u * FC * 8);
+    auto fetch_ld = [&](int i) {
         if(f_ld)
-            r_ld = opus::make_gmem(ld_ptr + qt0, rec_rows(seqlen_q - qt0, BQ, 4)).template load<1>(lane)[0];
+            r_ld = opus::make_gmem(ld_ptr + i * BQ, rec_rows(seqlen_q - i * BQ, BQ, 4)).template load<1>(lane)[0];
     };
-    auto stage = [&](int buf) {
+    auto stage_ld = [&](int buf) {
         if(f_ld)
             s_ld[buf][ld_slot] = r_ld;
-#pragma unroll
-        for(int u = 0; u < QR; u++)
-            *reinterpret_cast<vec8_t*>(smem + so_q + buf * BQ * LD_Q + u * FC * 8) = r_q[u];
-#pragma unroll
-        for(int u = 0; u < DR; u++)
-            *reinterpret_cast<vec8_t*>(smem + so_do + buf * BQ * LD_DO + u * FC * 8) = r_do[u];
     };
+    // The DMA writes land in LDS when vmcnt says so, which s_barrier does not wait for.
+    auto dma_wait = [] { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); };
 
     auto s_q  = [&](int b) { return opus::make_smem(smem + OFF_Q + b * BQ * LD_Q); };
     auto s_do = [&](int b) { return opus::make_smem(smem + OFF_DO + b * BQ * LD_DO); };
@@ -1335,44 +1375,129 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
             acc_dkr[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
     }
 
+    // K and V must be in registers before the loop: otherwise the compiler waits for them inside
+    // it, with vmcnt counts that the DMA loads then make block. 0x0f70 is s_waitcnt vmcnt(0).
+    __builtin_amdgcn_s_waitcnt(0x0f70);
     if(i_begin < n_q_tiles)
     {
-        fetch(i_begin);
-        stage(0);
+        dma(i_begin, 0);
+        fetch_ld(i_begin);
+        stage_ld(0);
         if(i_begin + 1 < n_q_tiles)
-            fetch(i_begin + 1);
+            fetch_ld(i_begin + 1);
     }
+    dma_wait();
     __syncthreads();
 
-    for(int i = i_begin; i < n_q_tiles; i++)
-    {
+    // One tile per iteration: issue the next tile's DMA, compute, wait for the DMA, barrier. The
+    // tiles this wave sees in full (no mask: every query valid, at or past its last key) form one
+    // contiguous range [i_full0, i_full1) and run the interleaved code; the masked ones before and
+    // after it run the plain code. Every wave passes one barrier per tile either way.
+    auto iter = [&](int i, auto full_c) {
         const int b   = (i - i_begin) & 1;
         const int qt0 = i * BQ;
-        // LSE (log2 domain) and D at this lane's queries: one float4 run per N tile.
-        f32x4_t lse4[NT], d4[NT];
+        // The other buffer held tile i - 1, read before the last barrier. LSE / D of tile i + 1
+        // are stored and those of tile i + 2 loaded before the DMA is issued: the compiler waits
+        // for its own loads with vmcnt(0), which would otherwise also wait for the DMA.
+        if(i + 1 < n_q_tiles)
+            stage_ld(b ^ 1);
+        if(i + 2 < n_q_tiles)
+            fetch_ld(i + 2);
+        if(i + 1 < n_q_tiles)
+            dma(i + 1, b ^ 1);
+        // With one wave per SIMD, VALU work overlaps MFMAs only where it sits between them in
+        // issue order (the wave stalls on an MFMA while the pipe is busy). The tile runs as four
+        // blocks fenced by sched_barrier(0): S^T; dP^T one MFMA at a time with the exp of one P
+        // element after each (S^T is complete); dV likewise with one dS element after each (dP^T
+        // is complete); dK. Inside a block, sched_barrier(SB_MEM_SALU) keeps that MFMA / VALU
+        // order and lets LDS, VMEM and SALU work move; the fences keep each block's LDS reads
+        // from all being hoisted to the top of the tile, which would exceed the VGPRs. Only tiles
+        // that need no mask run this way.
+        constexpr int SB_MEM_SALU = 0x4 | 0x10 | 0x80;  // SALU, all VMEM, all DS may cross
+        constexpr int KSV         = D_V / 32;
+        static_assert(KSV * MR * NT == NS && MR * NV == NS, "one P / dS element per MFMA");
+        auto tile_full = [&] {
+            f32x4_t lse4[NT];
 #pragma unroll
-        for(int tn = 0; tn < NT; tn++)
-        {
-            lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
-            d4[tn]   = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
+            for(int tn = 0; tn < NT; tn++)
+            {
+                lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
 #pragma unroll
-            for(int p = 0; p < 4; p++)
-                lse4[tn][p] *= LOG2_E;
-        }
+                for(int p = 0; p < 4; p++)
+                    lse4[tn][p] *= LOG2_E;
+            }
+            auto v_sp       = mma_s(v_kw, s_q(b).template load<8>(u_q));
+            const auto b_dp = s_do(b).template load<8>(u_do);
+            __builtin_amdgcn_sched_barrier(0);
 
-        const auto v_st = mma_s(v_kw, s_q(b).template load<8>(u_q));
-        opus::vector_t<float, NS> v_p;
-        // Tiles this wave sees in full take an unmasked exp (a scalar branch).
-        const bool full = (qt0 + BQ <= seqlen_q) & (row_w + WR <= seqlen_k) &
-                          (!k.causal | (qt0 + causal_offset >= row_w + WR - 1));
-        if(full)
-        {
+            opus::vector_t<float, NS> v_dpt;
 #pragma unroll
-            for(int e = 0; e < NS; e++)
-                v_p[e] = __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - lse4[e / 4 % NT][e % 4]);
-        }
-        else
-        {
+            for(int ks = 0; ks < KSV; ks++)
+#pragma unroll
+                for(int m = 0; m < MR; m++)
+#pragma unroll
+                    for(int tn = 0; tn < NT; tn++)
+                    {
+                        const int t = m * NT + tn;
+                        f32x4_t c;
+#pragma unroll
+                        for(int p = 0; p < 4; p++)
+                            c[p] = ks == 0 ? 0.0f : v_dpt[t * 4 + p];
+                        bvec<8> fa, fb;
+#pragma unroll
+                        for(int x = 0; x < 8; x++)
+                        {
+                            fa[x] = v_vw[(m * KSV + ks) * 8 + x];
+                            fb[x] = b_dp[(tn * KSV + ks) * 8 + x];
+                        }
+                        c = mma1(fa, fb, c);
+#pragma unroll
+                        for(int p = 0; p < 4; p++)
+                            v_dpt[t * 4 + p] = c[p];
+                        const int e   = (ks * MR + m) * NT + tn;
+                        const float x = v_sp[e] * scale_log2 - lse4[e / 4 % NT][e % 4];
+                        v_sp[e]       = __builtin_amdgcn_exp2f(x);
+                        __builtin_amdgcn_sched_barrier(SB_MEM_SALU);
+                    }
+            // C -> A: an M tile's 8 elements (both N tiles) are in the K order of tr_load_b_c_order.
+            const auto a_p = opus::cast<bf16_t>(v_sp);
+            __builtin_amdgcn_sched_barrier(0);
+
+            f32x4_t d4[NT];
+#pragma unroll
+            for(int tn = 0; tn < NT; tn++)
+                d4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
+            const auto b_dv = tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0);
+#pragma unroll
+            for(int m = 0; m < MR; m++)
+#pragma unroll
+                for(int n = 0; n < NV; n++)
+                {
+                    gated_mla_bwd::mfma_acc_16x16x32(acc_dv[m][n], gated_mla_bwd::frag8(a_p, m), gated_mla_bwd::frag8(b_dv, n));
+                    const int e = m * NV + n;
+                    v_sp[e]     = v_sp[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
+                    __builtin_amdgcn_sched_barrier(SB_MEM_SALU);
+                }
+            const auto a_ds = opus::cast<bf16_t>(v_sp);
+            __builtin_amdgcn_sched_barrier(0);
+
+            acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
+            acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
+        };
+        // Tiles that need the mask (few: the diagonal and sequence ends) take the plain order.
+        auto tile_masked = [&] {
+            f32x4_t lse4[NT], d4[NT];
+#pragma unroll
+            for(int tn = 0; tn < NT; tn++)
+            {
+                lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
+                d4[tn]   = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
+#pragma unroll
+                for(int p = 0; p < 4; p++)
+                    lse4[tn][p] *= LOG2_E;
+            }
+            const auto v_st = mma_s(v_kw, s_q(b).template load<8>(u_q));
+            opus::vector_t<float, NS> v_p;
 #pragma unroll
             for(int e = 0; e < NS; e++)
             {
@@ -1381,25 +1506,42 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
                 const float x = v_st[e] * scale_log2 - lse4[e / 4 % NT][e % 4];
                 v_p[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
             }
-        }
-        const auto v_dpt = mma_dp(v_vw, s_do(b).template load<8>(u_do));
-        opus::vector_t<float, NS> v_ds;
+            const auto v_dpt = mma_dp(v_vw, s_do(b).template load<8>(u_do));
+            opus::vector_t<float, NS> v_ds;
 #pragma unroll
-        for(int e = 0; e < NS; e++)
-            v_ds[e] = v_p[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
-        // C -> A: an M tile's 8 elements (both N tiles) are in the K order of tr_load_b_c_order.
-        const auto a_p  = opus::cast<bf16_t>(v_p);
-        const auto a_ds = opus::cast<bf16_t>(v_ds);
-        acc_gemm32(acc_dv, a_p, tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0));
-        acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
-        acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
+            for(int e = 0; e < NS; e++)
+                v_ds[e] = v_p[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
+            const auto a_p  = opus::cast<bf16_t>(v_p);
+            const auto a_ds = opus::cast<bf16_t>(v_ds);
+            acc_gemm32(acc_dv, a_p, tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0));
+            acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
+            acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
+        };
 
-        if(i + 1 < n_q_tiles)
-            stage(b ^ 1);
-        if(i + 2 < n_q_tiles)
-            fetch(i + 2);
+        if constexpr(decltype(full_c)::value)
+        tile_full();
+        else
+        tile_masked();
+        dma_wait();
         __syncthreads();
+    };
+    int i_full0 = n_q_tiles, i_full1 = n_q_tiles;
+    if(row_w + WR <= seqlen_k)
+    {
+        // causal: qt0 + causal_offset >= row_w + WR - 1; all: qt0 + BQ <= seqlen_q
+        const int need = row_w + WR - 1 - causal_offset;
+        i_full0 = k.causal && need > 0 ? (need + BQ - 1) / BQ : 0;
+        i_full1 = seqlen_q / BQ;
+        i_full0 = i_full0 < i_begin ? i_begin : (i_full0 > n_q_tiles ? n_q_tiles : i_full0);
+        i_full1 = i_full1 < i_full0 ? i_full0 : (i_full1 > n_q_tiles ? n_q_tiles : i_full1);
     }
+    int i = i_begin;
+    for(; i < i_full0; i++)
+        iter(i, std::false_type{});
+    for(; i < i_full1; i++)
+        iter(i, std::true_type{});
+    for(; i < n_q_tiles; i++)
+        iter(i, std::false_type{});
 
     // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32. The C fragments hold
     // 4 columns of 16 rows per instruction, so each wave transposes its 48 rows through LDS first
