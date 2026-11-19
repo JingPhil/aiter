@@ -144,6 +144,36 @@ __device__ inline void acc_gemm(f32x4_t (&acc)[MT][NT], const VA& a, const VB& b
             mfma_acc_16x16x16(acc[m][n], frag4(a, m), frag4(b, n));
 }
 
+// The 16x16x32 form of mfma_acc_16x16x16 (same layouts, hazards and drain).
+using u32x4_t = opus::vector_t<opus::u32_t, 4>;
+__device__ inline void mfma_acc_16x16x32(f32x4_t& acc, const u32x4_t& a, const u32x4_t& b)
+{
+    asm volatile("s_nop 1\n\tv_mfma_f32_16x16x32_bf16 %0, %2, %1, %0" : "+a"(acc) : "v"(a), "v"(b));
+}
+
+// 8 bf16 at element 8 i of a fragment, as the 128-bit MFMA operand.
+template <typename V>
+__device__ inline u32x4_t frag8(const V& v, int i)
+{
+    opus::vector_t<bf16_t, 8> r;
+#pragma unroll
+    for(int e = 0; e < 8; e++)
+        r[e] = v[8 * i + e];
+    return __builtin_bit_cast(u32x4_t, r);
+}
+
+template <int MT, int NT, typename VA, typename VB>
+__device__ inline void acc_gemm32(f32x4_t (&acc)[MT][NT], const VA& a, const VB& b)
+{
+    static_assert(opus::vector_traits<VA>::size() == MT * 8 && opus::vector_traits<VB>::size() == NT * 8,
+                  "one 16x16x32 fragment per tile");
+#pragma unroll
+    for(int m = 0; m < MT; m++)
+#pragma unroll
+        for(int n = 0; n < NT; n++)
+            mfma_acc_16x16x32(acc[m][n], frag8(a, m), frag8(b, n));
+}
+
 } // namespace gated_mla_bwd
 
 // One row of D_V = 128 bf16 per 16 lanes (8 per lane, one 16-byte access each).
@@ -1130,10 +1160,303 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     }
 }
 
+// dK / dV pass, 4 waves. Each wave runs at one per SIMD so that its 48 keys' K and V (A of
+// S^T and dP^T) stay in VGPRs and dK and dV in AGPRs: every LDS fragment of Q and dO feeds
+// three M tiles. GEMMs are per wave, C = A * B^T, all 16x16x32 MFMAs: S^T and dP^T over d; dV
+// and dK over the tile's 32 queries, with P^T and dS^T (the C fragments of S^T and dP^T, two N
+// tiles per M tile) as their A operands and transposed reads of the dO and Q tiles as B. Query
+// tiles go global -> registers -> LDS one tile ahead into the other buffer, one barrier per tile.
+__global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv_4w_kernel(gated_mla_bwd_kargs k)
+{
+    using namespace gated_mla_bwd_4w;
+    using gated_mla_bwd::acc_gemm32;
+    using gated_mla_bwd::bf16_t;
+    using gated_mla_bwd::bvec;
+    using gated_mla_bwd::f32x4_t;
+    using gated_mla_bwd::mfma_acc_drain;
+    using gated_mla_bwd::tr_load_b_c_order;
+    using opus::number;
+    using opus::operator""_I;
+    using vec8_t = bvec<8>;
+    constexpr float LOG2_E = 1.44269504089f;
+    constexpr int MR       = WR / 16;  // M tiles per wave
+    constexpr int NT       = BQ / 16;  // N tiles of S^T / dP^T
+    __shared__ __attribute__((aligned(16))) bf16_t smem[SMEM_ELEMS];
+    // LSE and D of a query tile, [lse | D], double-buffered like sQ.
+    __shared__ __attribute__((aligned(16))) float s_ld[2][2 * BQ];
+
+    const int tid  = static_cast<int>(opus::thread_id_x());
+    const int lane = tid % 64;
+    const int w    = __builtin_amdgcn_readfirstlane(tid / 64);
+    // Workgroup id -> (head, sequence, key block) as in gated_mla_bwd_kernel.
+    const int wg = static_cast<int>(opus::block_id_x());
+    const int h  = wg % HG + HG * (wg / (HG * k.num_seqs * k.n_kv_blocks));
+    const int g  = wg / HG % k.num_seqs;
+    const int j  = wg / (HG * k.num_seqs) % k.n_kv_blocks;
+    if(h >= k.H)
+        return;
+    auto sc            = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+    const int q0       = sc(k.ptr_seqstart_q[g]);
+    const int k0       = sc(k.ptr_seqstart_k[g]);
+    const int seqlen_q = sc(k.ptr_seqstart_q[g + 1]) - q0;
+    const int seqlen_k = sc(k.ptr_seqstart_k[g + 1]) - k0;
+    const int kv0      = j * BK;
+    if(kv0 >= seqlen_k)
+        return;
+    // Bottom-right causal: query qp sees keys kv <= qp + causal_offset.
+    const int causal_offset = seqlen_k - seqlen_q;
+    const int n_q_tiles     = (seqlen_q + BQ - 1) / BQ;
+    int i_begin             = 0;
+    if(k.causal && kv0 - causal_offset > 0)
+        i_begin = (kv0 - causal_offset) / BQ;
+
+    auto make_mma = [](auto e_m, auto e_n, auto e_k) {
+        return opus::make_tiled_mma<bf16_t, bf16_t, float>(
+            opus::seq<decltype(e_m)::value, decltype(e_n)::value, decltype(e_k)::value>{},
+            opus::seq<1, 1, 1>{},
+            opus::seq<16, 16, 32>{},
+            opus::mfma_adaptor_swap_ab{});
+    };
+    static_assert(D_V == D_NOPE, "dV and the nope part of dK share one tile shape");
+    static_assert(BQ == 32, "P^T / dS^T are the A operand of one 16x16x32 K step");
+    auto mma_s  = make_mma(number<MR>{}, number<NT>{}, number<D_QK / 32>{});    // S^T  [48 x 32]
+    auto mma_kn = make_mma(number<MR>{}, number<NT>{}, number<D_NOPE / 32>{});  // A of S^T, nope part
+    auto mma_kr = make_mma(number<MR>{}, number<NT>{}, number<D_ROT / 32>{});   // A of S^T, rope part
+    auto mma_dp = make_mma(number<MR>{}, number<NT>{}, number<D_V / 32>{});     // dP^T [48 x 32]
+    const auto c_ab = opus::make_tuple(0_I, lane % mma_s.grpm_a, 0_I, lane / mma_s.grpm_a);
+
+    auto rec = [](long long elems, int elem_bytes) -> unsigned int {
+        const long long b = elems > 0 ? elems * elem_bytes : 0;
+        return b >= 0xffffffffLL ? 0xffffffffu : static_cast<unsigned int>(b);
+    };
+    // Bytes of `rows` rows clamped to [0, cap], uniform (see gated_mla_bwd_kernel).
+    auto rec_rows = [](int rows, int cap, int row_bytes) -> unsigned int {
+        return static_cast<unsigned int>(
+            __builtin_amdgcn_readfirstlane((rows < 0 ? 0 : (rows > cap ? cap : rows)) * row_bytes));
+    };
+
+    // This wave's 48 keys as the A operand of S^T and dP^T; rows past seqlen_k read as 0.
+    const int row_w  = kv0 + w * WR;
+    const int rows_w = seqlen_k - row_w < WR ? (seqlen_k - row_w > 0 ? seqlen_k - row_w : 0) : WR;
+    auto g_kn = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_k_nope) + static_cast<long long>(k0 + row_w) * k.stride_k_n +
+                                    static_cast<long long>(h) * k.stride_k_h,
+                                rec(static_cast<long long>(rows_w) * k.stride_k_n, 2));
+    auto g_kr = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_k_rot) + static_cast<long long>(k0 + row_w) * k.stride_k_rot_n,
+                                rec(static_cast<long long>(rows_w) * k.stride_k_rot_n, 2));
+    auto g_v  = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_v) + static_cast<long long>(k0 + row_w) * k.stride_v_n +
+                                    static_cast<long long>(h) * k.stride_v_h,
+                                rec(static_cast<long long>(rows_w) * k.stride_v_n, 2));
+    const auto v_kn = g_kn.template load<8>(opus::partition_layout_a<8>(mma_kn, opus::make_tuple(k.stride_k_n, 1_I), c_ab));
+    const auto v_kr = g_kr.template load<8>(opus::partition_layout_a<8>(mma_kr, opus::make_tuple(k.stride_k_rot_n, 1_I), c_ab));
+    const auto v_vw = g_v.template load<8>(opus::partition_layout_a<8>(mma_dp, opus::make_tuple(k.stride_v_n, 1_I), c_ab));
+    // A of S^T is [M tile][K step][8]; nope and rope interleave per M tile.
+    constexpr int KS = D_QK / 32, KS_N = D_NOPE / 32, KS_R = D_ROT / 32;
+    typename decltype(mma_s)::vtype_a v_kw;
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+#pragma unroll
+        for(int ks = 0; ks < KS; ks++)
+#pragma unroll
+            for(int e = 0; e < 8; e++)
+            {
+                if(ks < KS_N)
+                    v_kw[(m * KS + ks) * 8 + e] = v_kn[(m * KS_N + ks) * 8 + e];
+                else
+                    v_kw[(m * KS + ks) * 8 + e] = v_kr[(m * KS_R + ks - KS_N) * 8 + e];
+            }
+
+    // Query tiles, with their LSE and D, go global -> registers -> LDS one tile ahead. Thread t
+    // owns row t / 8 of the tile, 3 chunks of 8 columns of Q and 2 of dO from column 8 (t % 8),
+    // every 8th chunk; rows past seqlen_q fall outside the descriptors and read as 0. LSE comes
+    // through lanes 0 .. BQ - 1 of wave 0 and D through those of wave 1 (a per-wave base keeps
+    // the descriptor uniform).
+    constexpr int FC = 8, QR = D_QK / 8 / FC, DR = D_V / 8 / FC;
+    static_assert(BLOCK == BQ * FC, "one tile row per 8 threads");
+    const int f_row = tid / FC, f_c = (tid % FC) * 8;
+    const int vo_q = f_row * k.stride_q_n + f_c, vo_do = f_row * k.stride_do_n + f_c;
+    const int so_q = OFF_Q + f_row * LD_Q + f_c, so_do = OFF_DO + f_row * LD_DO + f_c;
+    const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q) + static_cast<long long>(q0) * k.stride_q_n +
+                          static_cast<long long>(h) * k.stride_q_h;
+    const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(q0) * k.stride_do_n +
+                           static_cast<long long>(h) * k.stride_do_h;
+    const bool f_ld     = w < 2 && lane < BQ;
+    const int ld_slot   = (w == 0 ? 0 : BQ) + lane;
+    const float* ld_ptr = (w == 0 ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h + q0;
+    vec8_t r_q[QR], r_do[DR];
+    float r_ld = 0.0f;
+    auto fetch = [&](int i) {
+        const int qt0 = i * BQ;
+        auto g_q  = opus::make_gmem(q_ptr + static_cast<long long>(qt0) * k.stride_q_n,
+                                   rec_rows(seqlen_q - qt0, BQ, k.stride_q_n * 2));
+        auto g_do = opus::make_gmem(do_ptr + static_cast<long long>(qt0) * k.stride_do_n,
+                                    rec_rows(seqlen_q - qt0, BQ, k.stride_do_n * 2));
+#pragma unroll
+        for(int u = 0; u < QR; u++)
+            r_q[u] = g_q.template load<8>(vo_q + u * FC * 8);
+#pragma unroll
+        for(int u = 0; u < DR; u++)
+            r_do[u] = g_do.template load<8>(vo_do + u * FC * 8);
+        if(f_ld)
+            r_ld = opus::make_gmem(ld_ptr + qt0, rec_rows(seqlen_q - qt0, BQ, 4)).template load<1>(lane)[0];
+    };
+    auto stage = [&](int buf) {
+        if(f_ld)
+            s_ld[buf][ld_slot] = r_ld;
+#pragma unroll
+        for(int u = 0; u < QR; u++)
+            *reinterpret_cast<vec8_t*>(smem + so_q + buf * BQ * LD_Q + u * FC * 8) = r_q[u];
+#pragma unroll
+        for(int u = 0; u < DR; u++)
+            *reinterpret_cast<vec8_t*>(smem + so_do + buf * BQ * LD_DO + u * FC * 8) = r_do[u];
+    };
+
+    auto s_q  = [&](int b) { return opus::make_smem(smem + OFF_Q + b * BQ * LD_Q); };
+    auto s_do = [&](int b) { return opus::make_smem(smem + OFF_DO + b * BQ * LD_DO); };
+    const auto u_q  = opus::partition_layout_b<8>(mma_s, opus::make_tuple(number<LD_Q>{}, 1_I), c_ab);
+    const auto u_do = opus::partition_layout_b<8>(mma_dp, opus::make_tuple(number<LD_DO>{}, 1_I), c_ab);
+    // C element e = (m NT + tn) 4 + p of S^T / dP^T is key 16 m + lane % 16 of the wave and
+    // query 16 tn + 4 (lane / 16) + p of the tile.
+    constexpr int NS = decltype(mma_s)::tile_c_len;
+    static_assert(NS == MR * NT * 4);
+    const int c_kv = row_w + lane % 16, c_q = 4 * (lane / 16);
+    const float scale_log2 = k.softmax_scale * LOG2_E;
+
+    // dK and dV accumulators, [M tile][N tile] in the swap_ab C layout, in AGPRs.
+    constexpr int NV = D_V / 16, NR = D_ROT / 16;
+    f32x4_t acc_dv[MR][NV], acc_dkn[MR][NV], acc_dkr[MR][NR];
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+    {
+#pragma unroll
+        for(int n = 0; n < NV; n++)
+            acc_dv[m][n] = acc_dkn[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for(int n = 0; n < NR; n++)
+            acc_dkr[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+
+    if(i_begin < n_q_tiles)
+    {
+        fetch(i_begin);
+        stage(0);
+        if(i_begin + 1 < n_q_tiles)
+            fetch(i_begin + 1);
+    }
+    __syncthreads();
+
+    for(int i = i_begin; i < n_q_tiles; i++)
+    {
+        const int b   = (i - i_begin) & 1;
+        const int qt0 = i * BQ;
+        // LSE (log2 domain) and D at this lane's queries: one float4 run per N tile.
+        f32x4_t lse4[NT], d4[NT];
+#pragma unroll
+        for(int tn = 0; tn < NT; tn++)
+        {
+            lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
+            d4[tn]   = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
+#pragma unroll
+            for(int p = 0; p < 4; p++)
+                lse4[tn][p] *= LOG2_E;
+        }
+
+        const auto v_st = mma_s(v_kw, s_q(b).template load<8>(u_q));
+        opus::vector_t<float, NS> v_p;
+        // Tiles this wave sees in full take an unmasked exp (a scalar branch).
+        const bool full = (qt0 + BQ <= seqlen_q) & (row_w + WR <= seqlen_k) &
+                          (!k.causal | (qt0 + causal_offset >= row_w + WR - 1));
+        if(full)
+        {
+#pragma unroll
+            for(int e = 0; e < NS; e++)
+                v_p[e] = __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - lse4[e / 4 % NT][e % 4]);
+        }
+        else
+        {
+#pragma unroll
+            for(int e = 0; e < NS; e++)
+            {
+                const int kv = c_kv + 16 * (e / (4 * NT)), qp = qt0 + c_q + 16 * (e / 4 % NT) + e % 4;
+                const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
+                const float x = v_st[e] * scale_log2 - lse4[e / 4 % NT][e % 4];
+                v_p[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
+            }
+        }
+        const auto v_dpt = mma_dp(v_vw, s_do(b).template load<8>(u_do));
+        opus::vector_t<float, NS> v_ds;
+#pragma unroll
+        for(int e = 0; e < NS; e++)
+            v_ds[e] = v_p[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
+        // C -> A: an M tile's 8 elements (both N tiles) are in the K order of tr_load_b_c_order.
+        const auto a_p  = opus::cast<bf16_t>(v_p);
+        const auto a_ds = opus::cast<bf16_t>(v_ds);
+        acc_gemm32(acc_dv, a_p, tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0));
+        acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
+        acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
+
+        if(i + 1 < n_q_tiles)
+            stage(b ^ 1);
+        if(i + 2 < n_q_tiles)
+            fetch(i + 2);
+        __syncthreads();
+    }
+
+    // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32. The C fragments hold
+    // 4 columns of 16 rows per instruction, so each wave transposes its 48 rows through LDS first
+    // and stores whole rows; rows past seqlen_k fall outside the descriptors and are dropped.
+    mfma_acc_drain();
+    __syncthreads();
+    {
+        constexpr int LD_R = D_ROT + 4;  // [48][dK rope] fp32, over the same LDS
+        static_assert(WR * LD_R * 4 <= WR * LD_O * 2, "staging fits");
+        bf16_t* s_o = smem + w * WR * LD_O;
+        float* s_r  = reinterpret_cast<float*>(s_o);
+        // C element (m, n, e): row 16 m + lane % 16, column 16 n + 4 (lane / 16) + e.
+        const int c_row = lane % 16, c_col = 4 * (lane / 16);
+#pragma unroll
+        for(int m = 0; m < MR; m++)
+#pragma unroll
+            for(int n = 0; n < NV; n++)
+            {
+                bf16_t* o = s_o + (16 * m + c_row) * LD_O + 16 * n + c_col;
+                *reinterpret_cast<bvec<4>*>(o)          = opus::cast<bf16_t>(acc_dkn[m][n]);
+                *reinterpret_cast<bvec<4>*>(o + D_NOPE) = opus::cast<bf16_t>(acc_dv[m][n]);
+            }
+        bf16_t* dkv = reinterpret_cast<bf16_t*>(k.ptr_dkv) + static_cast<long long>(k0 + row_w) * k.stride_dkv_n +
+                      static_cast<long long>(h) * k.stride_dkv_h;
+        auto g_dkv = opus::make_gmem(dkv, rec(static_cast<long long>(rows_w) * k.stride_dkv_n, 2));
+        // 32 lanes x 8 bf16 per row, two rows per instruction.
+        constexpr int OC = (D_NOPE + D_V) / 8;
+#pragma unroll
+        for(int it = 0; it < WR * OC / 64; it++)
+        {
+            const int row = (it * 64 + lane) / OC, col = (lane % OC) * 8;
+            g_dkv.template store<8>(*reinterpret_cast<const vec8_t*>(s_o + row * LD_O + col), row * k.stride_dkv_n + col);
+        }
+#pragma unroll
+        for(int m = 0; m < MR; m++)
+#pragma unroll
+            for(int n = 0; n < NR; n++)
+                *reinterpret_cast<f32x4_t*>(s_r + (16 * m + c_row) * LD_R + 16 * n + c_col) = acc_dkr[m][n];
+        auto g_dkr = opus::make_gmem(k.ptr_dk_rope + static_cast<long long>(k0 + row_w) * k.stride_dkr_n +
+                                         static_cast<long long>(h) * k.stride_dkr_h,
+                                     rec(static_cast<long long>(rows_w) * k.stride_dkr_n, 4));
+        // 16 lanes x 4 fp32 per row, four rows per instruction.
+        constexpr int RC = D_ROT / 4;
+#pragma unroll
+        for(int it = 0; it < WR * RC / 64; it++)
+        {
+            const int row = (it * 64 + lane) / RC, col = (lane % RC) * 4;
+            g_dkr.template store<4>(*reinterpret_cast<const f32x4_t*>(s_r + row * LD_R + col), row * k.stride_dkr_n + col);
+        }
+    }
+}
+
 #else
 __global__ void gated_mla_bwd_pre_kernel(gated_mla_bwd_pre_kargs) {}
 template <bool DQ>
 __global__ void gated_mla_bwd_kernel(gated_mla_bwd_kargs) {}
 __global__ void gated_mla_bwd_dkdv_pair_kernel(gated_mla_bwd_kargs) {}
+__global__ void gated_mla_bwd_dkdv_4w_kernel(gated_mla_bwd_kargs) {}
 __global__ void gated_mla_bwd_dq_kernel(gated_mla_bwd_dq_kargs) {}
 #endif

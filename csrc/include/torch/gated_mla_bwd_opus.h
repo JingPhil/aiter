@@ -44,7 +44,8 @@ void gated_mla_bwd_bf16_opus(at::Tensor& q,
                              bool causal,
                              float softmax_scale);
 
-// The main pass without dQ: same arguments and outputs minus dq_acc. Pair it with the dQ pass.
+// dK / dV only (4 waves x 48 keys on 32-query tiles): same arguments and outputs as the main
+// pass minus dq_acc. Pair it with the dQ pass.
 void gated_mla_bwd_dkdv_bf16_opus(at::Tensor& q,
                                   at::Tensor& k_nope,
                                   at::Tensor& v,

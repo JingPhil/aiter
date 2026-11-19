@@ -92,6 +92,27 @@ constexpr int OFF_KT  = OFF_DST + 2 * BK * LD_T;
 constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KT;
 } // namespace gated_mla_bwd
 
+// dK / dV pass, 4 waves: each wave (one per SIMD) owns 48 keys with their K, V, dK and dV
+// (accumulators in AGPRs), on 32-query tiles so that every GEMM is a full-rate 16x16x32 MFMA.
+// Takes gated_mla_bwd_kargs (n_kv_blocks counted in BK = 192); ptr_dq_acc is unused.
+namespace gated_mla_bwd_4w {
+constexpr int BK = 192;  // keys per workgroup
+constexpr int NW = 4;    // waves; wave w owns keys [48 w, 48 w + 48)
+constexpr int WR = BK / NW;
+constexpr int BQ = 32;   // queries per tile
+constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
+constexpr int BLOCK = NW * 64;
+constexpr int HG = 16;
+// LDS, bf16, double-buffered by query-tile parity: sQ [BQ][D_QK] (B of S^T; B of dK,
+// transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed), rows padded by 16 elements
+// (conflict-free, see gated_mla_bwd_pair). The epilogue then transposes each wave's
+// [48][dK nope | dV] through the same LDS.
+constexpr int LD_Q = D_QK + 16, LD_DO = D_V + 16, LD_O = D_NOPE + D_V + 8;
+constexpr int OFF_Q = 0, OFF_DO = OFF_Q + 2 * BQ * LD_Q;
+constexpr int SMEM_MAIN = OFF_DO + 2 * BQ * LD_DO, SMEM_EPI = NW * WR * LD_O;
+constexpr int SMEM_ELEMS = SMEM_MAIN > SMEM_EPI ? SMEM_MAIN : SMEM_EPI;
+} // namespace gated_mla_bwd_4w
+
 // dK / dV pass, 8 waves: the two waves of a SIMD (w, w + 4) share 32 keys and split the work by
 // dependency chain (S wave: S^T, P, dV; dP wave: dP^T, dS, dK). Takes gated_mla_bwd_kargs
 // (n_kv_blocks counted in BK = 128); ptr_dq_acc is unused.

@@ -159,7 +159,7 @@ void launch_main(at::Tensor& q,
     a.causal         = causal ? 1 : 0;
     if(total_q == 0 || total_k == 0 || H == 0)
         return;
-    const int bk  = pair ? gated_mla_bwd_pair::BK : BK;
+    const int bk  = pair ? gated_mla_bwd_pair::BK : (dq_acc ? BK : gated_mla_bwd_4w::BK);
     a.num_seqs    = B;
     a.n_kv_blocks = (max_seqlen_k + bk - 1) / bk;
     const long long n_wg = static_cast<long long>(HG) * a.n_kv_blocks * B * ((H + HG - 1) / HG);
@@ -175,8 +175,10 @@ void launch_main(at::Tensor& q,
         gated_mla_bwd_kernel<true>
             <<<dim3(static_cast<unsigned>(n_wg)), dim3(BLOCK), 0, at::hip::getCurrentHIPStream()>>>(a);
     else
-        gated_mla_bwd_kernel<false>
-            <<<dim3(static_cast<unsigned>(n_wg)), dim3(BLOCK), 0, at::hip::getCurrentHIPStream()>>>(a);
+        gated_mla_bwd_dkdv_4w_kernel<<<dim3(static_cast<unsigned>(n_wg)),
+                                       dim3(gated_mla_bwd_4w::BLOCK),
+                                       0,
+                                       at::hip::getCurrentHIPStream()>>>(a);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
