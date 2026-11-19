@@ -105,8 +105,9 @@ constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
 constexpr int HG = 16;
 // LDS, bf16, double-buffered by query-tile parity: sQ [BQ][D_QK] (B of S^T; B of dK,
-// transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed), rows padded by 8 elements.
-constexpr int LD_Q = D_QK + 8, LD_DO = D_V + 8;
+// transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed). Rows padded by 16 elements:
+// with 8, both the B-fragment ds_read_b128 and the ds_read_b64_tr_b16 reads conflict 2-way.
+constexpr int LD_Q = D_QK + 16, LD_DO = D_V + 16;
 constexpr int OFF_Q = 0, OFF_DO = OFF_Q + 2 * BQ * LD_Q;
 constexpr int SMEM_ELEMS = OFF_DO + 2 * BQ * LD_DO;
 } // namespace gated_mla_bwd_pair
@@ -149,8 +150,8 @@ constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
 constexpr int HG = 16;         // heads per scheduling group, as in the main pass
 // LDS, bf16, double-buffered key tiles: sK [KC][D_QK] (B of S; B of dQ, transposed) and
-// sV [KC][D_V] (B of dP), rows padded by 8 elements.
-constexpr int LD_K = D_QK + 8, LD_V = D_V + 8;
+// sV [KC][D_V] (B of dP), rows padded by 16 elements (conflict-free, see gated_mla_bwd_pair).
+constexpr int LD_K = D_QK + 16, LD_V = D_V + 16;
 constexpr int OFF_K = 0, OFF_V = 2 * KC * LD_K;
 constexpr int SMEM_ELEMS = OFF_V + 2 * KC * LD_V;
 } // namespace gated_mla_bwd_dq
