@@ -293,23 +293,38 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
                     v_kw[(m * KS + ks) * 8 + e] = v_kr[(m * KS_R + ks - KS_N) * 8 + e];
             }
 
-    // The whole key block as K^T [d][kv], the A operand of dQ^T. Consecutive threads take
-    // consecutive keys, so each 2-byte store instruction covers one contiguous K^T row segment.
-    for(int c = tid; c < BK * D_QK / 8; c += BLOCK)
+    // The whole key block as K^T [d][kv], the A operand of dQ^T. Chunk c = it BLOCK + tid is key
+    // c % BK, columns 8 (c / BK) .. + 7: consecutive threads take consecutive keys, so each 2-byte
+    // LDS store covers one contiguous K^T row segment, and the first KT_NOPE rounds read k_nope,
+    // the rest k_rot. All loads are issued before the transposing stores; keys past seqlen_k
+    // fall outside the descriptors and read as 0.
     {
-        const int r = c % BK, c8 = (c / BK) * 8, kv = kv0 + r;
-        vec8_t v;
-        if(kv < seqlen_k)
-            v = *reinterpret_cast<const vec8_t*>(
-                c8 < D_NOPE ? k_nope + static_cast<long long>(k0 + kv) * k.stride_k_n +
-                                  static_cast<long long>(h) * k.stride_k_h + c8
-                            : k_rot + static_cast<long long>(k0 + kv) * k.stride_k_rot_n + c8 - D_NOPE);
-        else
-            for(int e = 0; e < 8; e++)
-                v[e] = bf16_t(0.0f);
+        constexpr int KT_ROUNDS = BK * D_QK / 8 / BLOCK, KT_NOPE = BK * D_NOPE / 8 / BLOCK;
+        static_assert(KT_ROUNDS * BLOCK * 8 == BK * D_QK && KT_NOPE * BLOCK * 8 == BK * D_NOPE,
+                      "whole rounds, each within one of k_nope / k_rot");
+        auto g_kb = opus::make_gmem(k_nope + static_cast<long long>(k0 + kv0) * k.stride_k_n +
+                                        static_cast<long long>(h) * k.stride_k_h,
+                                    rec(static_cast<long long>(seqlen_k - kv0) * k.stride_k_n, 2));
+        auto g_rb = opus::make_gmem(k_rot + static_cast<long long>(k0 + kv0) * k.stride_k_rot_n,
+                                    rec(static_cast<long long>(seqlen_k - kv0) * k.stride_k_rot_n, 2));
+        vec8_t kt[KT_ROUNDS];
 #pragma unroll
-        for(int e = 0; e < 8; e++)
-            smem[OFF_KT + (c8 + e) * LD_KT + r] = v[e];
+        for(int it = 0; it < KT_ROUNDS; it++)
+        {
+            const int c = it * BLOCK + tid, r = c % BK, c8 = (c / BK) * 8;
+            if(it < KT_NOPE)
+                kt[it] = g_kb.template load<8>(r * k.stride_k_n + c8);
+            else
+                kt[it] = g_rb.template load<8>(r * k.stride_k_rot_n + c8 - D_NOPE);
+        }
+#pragma unroll
+        for(int it = 0; it < KT_ROUNDS; it++)
+        {
+            const int c = it * BLOCK + tid, r = c % BK, c8 = (c / BK) * 8;
+#pragma unroll
+            for(int e = 0; e < 8; e++)
+                smem[OFF_KT + (c8 + e) * LD_KT + r] = kt[it][e];
+        }
     }
 
     // Query tiles, with their LSE and D, go global -> registers -> LDS one tile ahead. Waves 0-1
@@ -329,7 +344,11 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
                                     static_cast<long long>(h) * k.stride_q_h
                                : reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(q0) * k.stride_do_n +
                                     static_cast<long long>(h) * k.stride_do_h;
-    const float* ld_ptr  = (tid < BQ ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h + q0;
+    // LSE through lanes 0-15 of wave 0 and D through those of wave 1: choosing the tensor per wave
+    // keeps each load's descriptor uniform, where a per-lane choice makes it a waterfall loop.
+    const bool f_ld     = w < 2 && lane < BQ;
+    const int ld_slot   = (w == 0 ? 0 : BQ) + lane;
+    const float* ld_ptr = (w == 0 ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h + q0;
     vec8_t r_f[QR];
     float r_ld = 0.0f;
     auto fetch = [&](int i) {
@@ -340,15 +359,12 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         for(int u = 0; u < QR; u++)
             if(u < f_chunks)
                 r_f[u] = g_f.template load<8>(f_vo + u * FC * 8);
-        if(tid < 2 * BQ)
-        {
-            auto g_ld = opus::make_gmem(ld_ptr + qt0, rec(seqlen_q - qt0, 4));
-            r_ld      = g_ld.template load<1>(tid % BQ)[0];
-        }
+        if(f_ld)
+            r_ld = opus::make_gmem(ld_ptr + qt0, rec(seqlen_q - qt0, 4)).template load<1>(lane)[0];
     };
     auto stage = [&](int buf) {
-        if(tid < 2 * BQ)
-            s_ld[buf][tid] = r_ld;
+        if(f_ld)
+            s_ld[buf][ld_slot] = r_ld;
 #pragma unroll
         for(int u = 0; u < QR; u++)
             if(u < f_chunks)
@@ -463,38 +479,56 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         dq_tile(b, qt0);
     }
 
-    // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32; rows past seqlen_k
-    // fall outside the descriptors and are dropped.
-    bf16_t* dkv = reinterpret_cast<bf16_t*>(k.ptr_dkv) + static_cast<long long>(k0 + row_w) * k.stride_dkv_n +
-                  static_cast<long long>(h) * k.stride_dkv_h;
-    const long long dkv_elems = static_cast<long long>(rows_w) * k.stride_dkv_n;
-    auto g_dkn = opus::make_gmem(dkv, rec(dkv_elems, 2));
-    auto g_dv  = opus::make_gmem(dkv + D_NOPE, rec(dkv_elems - D_NOPE, 2));
-    auto g_dkr = opus::make_gmem(k.ptr_dk_rope + static_cast<long long>(k0 + row_w) * k.stride_dkr_n +
-                                     static_cast<long long>(h) * k.stride_dkr_h,
-                                 rec(static_cast<long long>(rows_w) * k.stride_dkr_n, 4));
+    // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32. The C fragments hold
+    // 4 columns of 16 rows per instruction, so each wave transposes its 48 rows through LDS first
+    // and stores whole rows; rows past seqlen_k fall outside the descriptors and are dropped.
     mfma_acc_drain();
-    typename decltype(mma_dv)::vtype_c v_dv, v_dkn;
-    typename decltype(mma_dkr)::vtype_c v_dkr;
+    __syncthreads();
+    {
+        constexpr int LD_O = D_NOPE + D_V + 8;  // [48][dK nope | dV] bf16
+        constexpr int LD_R = D_ROT + 4;         // [48][dK rope] fp32, over the same LDS
+        static_assert(NW * WR * LD_O <= SMEM_ELEMS && WR * LD_R * 4 <= WR * LD_O * 2, "staging fits");
+        bf16_t* s_o = smem + w * WR * LD_O;
+        float* s_r  = reinterpret_cast<float*>(s_o);
+        // C element (m, n, e): row 16 m + lane % 16, column 16 n + 4 (lane / 16) + e.
+        const int c_row = lane % 16, c_col = 4 * (lane / 16);
 #pragma unroll
-    for(int m = 0; m < MR; m++)
-#pragma unroll
-        for(int e = 0; e < 4; e++)
-        {
+        for(int m = 0; m < MR; m++)
 #pragma unroll
             for(int n = 0; n < NV; n++)
             {
-                v_dv[(m * NV + n) * 4 + e]  = acc_dv[m][n][e];
-                v_dkn[(m * NV + n) * 4 + e] = acc_dkn[m][n][e];
+                bf16_t* o = s_o + (16 * m + c_row) * LD_O + 16 * n + c_col;
+                *reinterpret_cast<bvec<4>*>(o)          = opus::cast<bf16_t>(acc_dkn[m][n]);
+                *reinterpret_cast<bvec<4>*>(o + D_NOPE) = opus::cast<bf16_t>(acc_dv[m][n]);
             }
+        bf16_t* dkv = reinterpret_cast<bf16_t*>(k.ptr_dkv) + static_cast<long long>(k0 + row_w) * k.stride_dkv_n +
+                      static_cast<long long>(h) * k.stride_dkv_h;
+        auto g_dkv = opus::make_gmem(dkv, rec(static_cast<long long>(rows_w) * k.stride_dkv_n, 2));
+        // 32 lanes x 8 bf16 per row, two rows per instruction.
+        constexpr int OC = (D_NOPE + D_V) / 8;
+#pragma unroll
+        for(int it = 0; it < WR * OC / 64; it++)
+        {
+            const int row = (it * 64 + lane) / OC, col = (lane % OC) * 8;
+            g_dkv.template store<8>(*reinterpret_cast<const vec8_t*>(s_o + row * LD_O + col), row * k.stride_dkv_n + col);
+        }
+#pragma unroll
+        for(int m = 0; m < MR; m++)
 #pragma unroll
             for(int n = 0; n < NR; n++)
-                v_dkr[(m * NR + n) * 4 + e] = acc_dkr[m][n][e];
+                *reinterpret_cast<f32x4_t*>(s_r + (16 * m + c_row) * LD_R + 16 * n + c_col) = acc_dkr[m][n];
+        auto g_dkr = opus::make_gmem(k.ptr_dk_rope + static_cast<long long>(k0 + row_w) * k.stride_dkr_n +
+                                         static_cast<long long>(h) * k.stride_dkr_h,
+                                     rec(static_cast<long long>(rows_w) * k.stride_dkr_n, 4));
+        // 16 lanes x 4 fp32 per row, four rows per instruction.
+        constexpr int RC = D_ROT / 4;
+#pragma unroll
+        for(int it = 0; it < WR * RC / 64; it++)
+        {
+            const int row = (it * 64 + lane) / RC, col = (lane % RC) * 4;
+            g_dkr.template store<4>(*reinterpret_cast<const f32x4_t*>(s_r + row * LD_R + col), row * k.stride_dkr_n + col);
         }
-    const auto u_dkv = opus::partition_layout_c(mma_dv, opus::make_tuple(k.stride_dkv_n, 1_I), c_c);
-    g_dkn.template store<4>(opus::cast<bf16_t>(v_dkn), u_dkv);
-    g_dv.template store<4>(opus::cast<bf16_t>(v_dv), u_dkv);
-    g_dkr.template store<4>(v_dkr, opus::partition_layout_c(mma_dkr, opus::make_tuple(k.stride_dkr_n, 1_I), c_c));
+    }
 }
 
 #else
