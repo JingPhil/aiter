@@ -259,6 +259,13 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         const long long b = elems > 0 ? elems * elem_bytes : 0;
         return b >= 0xffffffffLL ? 0xffffffffu : static_cast<unsigned int>(b);
     };
+    // Bytes of `rows` rows clamped to [0, cap], for the per-tile descriptors: 32-bit math, where
+    // rec's 64-bit compares go to the VALU. readfirstlane marks the size uniform; a size the
+    // compiler cannot prove uniform turns every access through the descriptor into a waterfall loop.
+    auto rec_rows = [](int rows, int cap, int row_bytes) -> unsigned int {
+        return static_cast<unsigned int>(
+            __builtin_amdgcn_readfirstlane((rows < 0 ? 0 : (rows > cap ? cap : rows)) * row_bytes));
+    };
 
     // This wave's 48 keys as the A operand of S^T and dP^T; rows past seqlen_k read as 0.
     const int row_w  = kv0 + w * WR;
@@ -353,14 +360,13 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
     float r_ld = 0.0f;
     auto fetch = [&](int i) {
         const int qt0 = i * BQ;
-        auto g_f = opus::make_gmem(f_ptr + static_cast<long long>(qt0) * f_rows,
-                                   rec(static_cast<long long>(seqlen_q - qt0) * f_rows, 2));
+        auto g_f = opus::make_gmem(f_ptr + static_cast<long long>(qt0) * f_rows, rec_rows(seqlen_q - qt0, BQ, f_rows * 2));
 #pragma unroll
         for(int u = 0; u < QR; u++)
             if(u < f_chunks)
                 r_f[u] = g_f.template load<8>(f_vo + u * FC * 8);
         if(f_ld)
-            r_ld = opus::make_gmem(ld_ptr + qt0, rec(seqlen_q - qt0, 4)).template load<1>(lane)[0];
+            r_ld = opus::make_gmem(ld_ptr + qt0, rec_rows(seqlen_q - qt0, BQ, 4)).template load<1>(lane)[0];
     };
     auto stage = [&](int buf) {
         if(f_ld)
@@ -409,7 +415,7 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
         opus::static_for<4>([&](auto p) {
             const int qr = qt0 + p.value;
             auto g_dq    = opus::make_gmem(dq_base + static_cast<long long>(qr) * k.stride_dq_n,
-                                        rec(static_cast<long long>(seqlen_q - qr) * k.stride_dq_n, 4));
+                                        rec_rows(seqlen_q - qr, BQ, k.stride_dq_n * 4));
             opus::static_for<DQ_M / 16>([&](auto tm) {
                 g_dq.template atomic_add<1>(v_dq[tm.value * 4 + p.value], dq_vo, 0, number<16 * tm.value>{});
             });
@@ -449,14 +455,27 @@ __global__ __launch_bounds__(gated_mla_bwd::BLOCK, 1) void gated_mla_bwd_kernel(
 
         const auto v_st = mma_s(v_kw, s_q(b).template load<8>(u_q));
         opus::vector_t<float, NS> v_p;
-#pragma unroll
-        for(int e = 0; e < NS; e++)
+        // Most tiles need no mask for this wave's keys: all queries valid and, if causal, every
+        // query at or past the wave's last key. The test is wave-uniform, so it is a scalar branch.
+        const bool full = (qt0 + BQ <= seqlen_q) & (row_w + WR <= seqlen_k) &
+                          (!k.causal | (qt0 + causal_offset >= row_w + WR - 1));
+        if(full)
         {
-            const int kv = row_w + pos_s[e] / 256, qp = qt0 + pos_s[e] % 256;
-            // Non-short-circuit tests and a selected exponent keep the masked exp branch-free.
-            const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
-            const float x = v_st[e] * scale_log2 - lse4[e % 4] * LOG2_E;
-            v_p[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
+#pragma unroll
+            for(int e = 0; e < NS; e++)
+                v_p[e] = __builtin_amdgcn_exp2f(v_st[e] * scale_log2 - lse4[e % 4] * LOG2_E);
+        }
+        else
+        {
+#pragma unroll
+            for(int e = 0; e < NS; e++)
+            {
+                const int kv = row_w + pos_s[e] / 256, qp = qt0 + pos_s[e] % 256;
+                // Non-short-circuit tests and a selected exponent keep the masked exp branch-free.
+                const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
+                const float x = v_st[e] * scale_log2 - lse4[e % 4] * LOG2_E;
+                v_p[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
+            }
         }
         const auto v_dpt = mma_dp(v_vw, s_do(b).template load<8>(u_do));
         opus::vector_t<float, NS> v_ds;
