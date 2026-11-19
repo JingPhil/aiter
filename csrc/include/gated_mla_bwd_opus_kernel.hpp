@@ -1296,18 +1296,27 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     };
     float* s_p = reinterpret_cast<float*>(smem + OFF_P) + pr * PR * BQ;
 
-    // B fragments of LA steps in flight, in a ring of LA slots: a step issues its MFMAs, then reads
-    // the fragments of step + LA into the slot they have just consumed.
-    constexpr int LA = 2;
-    frag_t ring[LA];
+    // B fragments of LA steps in flight, in a ring of LA + 1 slots: a step's reads (of step + LA)
+    // go to the slot step - 1 consumed, so that they can issue between the step's own MFMAs, one
+    // after each: an MFMA leaves 8 of its 16 cycles to issue other instructions, as much as one
+    // ds_read_b64_tr_b16 or two SALU instructions take.
+    constexpr int LA = 2, RS = LA + 1;
+    frag_t ring[RS];
     auto c_stage = [&](auto n_steps, auto ld, auto ex) {
         constexpr int N = decltype(n_steps)::value;
 #pragma unroll
         for(int st = 0; st < N; st++)
         {
-            ex(st, ring[st % LA]);
+            ex(st, ring[st % RS]);
             if(st + LA < N)
-                ring[st % LA] = ld(st + LA);
+                ring[(st + LA) % RS] = ld(st + LA);
+#pragma unroll
+            for(int m = 0; m < MR * NT; m++)
+            {
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);  // MFMA
+                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);  // DS read
+                __builtin_amdgcn_sched_group_barrier(0x004, 2, 0);  // SALU
+            }
             __builtin_amdgcn_sched_barrier(0);
         }
     };
@@ -1427,27 +1436,40 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 a_tdo = addr(bt, OFF_DO, o_tdo);
                 a_q   = addr(b1, OFF_Q, o_q);
                 prefetch(ld_q);
+                // Each float4 of P goes to LDS as soon as its exps are done, the next exps issuing
+                // while it waits in the LDS queue: four writes back to back wait there in turn.
+                auto write_p = [&](int c) {
+                    *reinterpret_cast<f32x4_t*>(s_p + (c * 64 + lane) * 4) =
+                        f32x4_t{v_s[c * 4], v_s[c * 4 + 1], v_s[c * 4 + 2], v_s[c * 4 + 3]};
+                    __builtin_amdgcn_sched_barrier(0);
+                };
                 if(static_cast<unsigned int>(t - i_full0) < static_cast<unsigned int>(i_full1 - i_full0))
                 {
 #pragma unroll
-                    for(int e = 0; e < NS; e++)
-                        v_s[e] = __builtin_amdgcn_exp2f(v_s[e] * scale_log2 - lse_e[e]);
+                    for(int c = 0; c < NS / 4; c++)
+                    {
+#pragma unroll
+                        for(int e = c * 4; e < c * 4 + 4; e++)
+                            v_s[e] = __builtin_amdgcn_exp2f(v_s[e] * scale_log2 - lse_e[e]);
+                        write_p(c);
+                    }
                 }
                 else
                 {
 #pragma unroll
-                    for(int e = 0; e < NS; e++)
+                    for(int c = 0; c < NS / 4; c++)
                     {
-                        const int kv = c_kv + 16 * (e / (4 * NT)), qp = qt0 + c_q + 16 * (e / 4 % NT) + e % 4;
-                        const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
-                        const float x = v_s[e] * scale_log2 - lse_e[e];
-                        v_s[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
+#pragma unroll
+                        for(int e = c * 4; e < c * 4 + 4; e++)
+                        {
+                            const int kv = c_kv + 16 * (e / (4 * NT)), qp = qt0 + c_q + 16 * (e / 4 % NT) + e % 4;
+                            const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
+                            const float x = v_s[e] * scale_log2 - lse_e[e];
+                            v_s[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
+                        }
+                        write_p(c);
                     }
                 }
-#pragma unroll
-                for(int c = 0; c < NS / 4; c++)
-                    *reinterpret_cast<f32x4_t*>(s_p + (c * 64 + lane) * 4) =
-                        f32x4_t{v_s[c * 4], v_s[c * 4 + 1], v_s[c * 4 + 2], v_s[c * 4 + 3]};
                 // C -> A: the K order of this fragment is what tr_load_b_c_order supplies.
                 p_bf = opus::cast<bf16_t>(v_s);
                 pin(p_bf);
