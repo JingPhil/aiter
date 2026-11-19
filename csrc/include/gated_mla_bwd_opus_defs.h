@@ -170,9 +170,15 @@ constexpr int KC = 32;         // keys per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
 constexpr int HG = 16;         // heads per scheduling group, as in the main pass
-// LDS, bf16, double-buffered key tiles: sK [KC][D_QK] (B of S; B of dQ, transposed) and
-// sV [KC][D_V] (B of dP), rows padded by 16 elements (conflict-free, see gated_mla_bwd_pair).
-constexpr int LD_K = D_QK + 16, LD_V = D_V + 16;
-constexpr int OFF_K = 0, OFF_V = 2 * KC * LD_K;
-constexpr int SMEM_ELEMS = OFF_V + 2 * KC * LD_V;
+// LDS, bf16: NBUF key tiles, each sKN [KC][D_NOPE] and sKR [KC][D_ROT] (K; B of S, and of dQ
+// transposed) and sV [KC][D_V] (B of dP). K's two parts come from two tensors, so each part is
+// one DMA region. Rows padded by 16 elements (conflict-free, see gated_mla_bwd_pair).
+// After them, sQR [BQ][D_ROT]: the rope part of each wave's Q (A of S's last K steps), kept in
+// LDS to save its registers.
+constexpr int NBUF = 4;
+constexpr int LD_KN = D_NOPE + 16, LD_KR = D_ROT + 16, LD_V = D_V + 16, LD_QR = D_ROT + 16;
+constexpr int OFF_KN = 0, OFF_KR = OFF_KN + KC * LD_KN, OFF_V = OFF_KR + KC * LD_KR;
+constexpr int SZ_BUF     = OFF_V + KC * LD_V;
+constexpr int OFF_QR     = NBUF * SZ_BUF;
+constexpr int SMEM_ELEMS = OFF_QR + BQ * LD_QR;
 } // namespace gated_mla_bwd_dq
