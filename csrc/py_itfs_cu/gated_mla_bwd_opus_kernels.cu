@@ -89,7 +89,8 @@ void launch_main(at::Tensor& q,
                  at::Tensor& seqstart_k,
                  int max_seqlen_k,
                  bool causal,
-                 float softmax_scale)
+                 float softmax_scale,
+                 bool pair = false)
 {
     using namespace gated_mla_bwd;
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
@@ -158,13 +159,19 @@ void launch_main(at::Tensor& q,
     a.causal         = causal ? 1 : 0;
     if(total_q == 0 || total_k == 0 || H == 0)
         return;
+    const int bk  = pair ? gated_mla_bwd_pair::BK : BK;
     a.num_seqs    = B;
-    a.n_kv_blocks = (max_seqlen_k + BK - 1) / BK;
+    a.n_kv_blocks = (max_seqlen_k + bk - 1) / bk;
     const long long n_wg = static_cast<long long>(HG) * a.n_kv_blocks * B * ((H + HG - 1) / HG);
     TORCH_CHECK(n_wg <= 0x7fffffffLL, "too many workgroups");
 
     HipDeviceGuard guard(q.device().index());
-    if(dq_acc)
+    if(pair)
+        gated_mla_bwd_dkdv_pair_kernel<<<dim3(static_cast<unsigned>(n_wg)),
+                                         dim3(gated_mla_bwd_pair::BLOCK),
+                                         0,
+                                         at::hip::getCurrentHIPStream()>>>(a);
+    else if(dq_acc)
         gated_mla_bwd_kernel<true>
             <<<dim3(static_cast<unsigned>(n_wg)), dim3(BLOCK), 0, at::hip::getCurrentHIPStream()>>>(a);
     else
@@ -212,6 +219,25 @@ void gated_mla_bwd_dkdv_bf16_opus(at::Tensor& q,
 {
     launch_main(q, k_nope, v, k_rot, d_o, lse, d, nullptr, dkv, dk_rope, seqstart_q, seqstart_k,
                 max_seqlen_k, causal, softmax_scale);
+}
+
+void gated_mla_bwd_dkdv_pair_bf16_opus(at::Tensor& q,
+                                       at::Tensor& k_nope,
+                                       at::Tensor& v,
+                                       at::Tensor& k_rot,
+                                       at::Tensor& d_o,
+                                       at::Tensor& lse,
+                                       at::Tensor& d,
+                                       at::Tensor& dkv,
+                                       at::Tensor& dk_rope,
+                                       at::Tensor& seqstart_q,
+                                       at::Tensor& seqstart_k,
+                                       int max_seqlen_k,
+                                       bool causal,
+                                       float softmax_scale)
+{
+    launch_main(q, k_nope, v, k_rot, d_o, lse, d, nullptr, dkv, dk_rope, seqstart_q, seqstart_k,
+                max_seqlen_k, causal, softmax_scale, true);
 }
 
 void gated_mla_bwd_dq_bf16_opus(at::Tensor& q,

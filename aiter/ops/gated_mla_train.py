@@ -197,6 +197,30 @@ def _gated_mla_bwd_dkdv_bf16_opus(
 ) -> None: ...
 
 
+# As _gated_mla_bwd_dkdv_bf16_opus, on the 8-wave kernel whose wave pairs split by dependency chain.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_dkdv_pair_bf16_opus",
+    gen_fake=_gated_mla_bwd_dkdv_bf16_opus_fake,
+)
+def _gated_mla_bwd_dkdv_pair_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
 def _gated_mla_bwd_dq_bf16_opus_fake(
     q: Tensor,
     k_nope: Tensor,
@@ -238,8 +262,8 @@ def _gated_mla_bwd_dq_bf16_opus(
 ) -> None: ...
 
 
-# How the backward computes dQ: "separate" runs a dQ pass after the dK/dV pass, "atomic" adds
-# dQ into an fp32 buffer from the dK/dV pass.
+# How the backward computes dQ: "separate" runs a dQ pass after the 8-wave dK/dV pass, "atomic"
+# adds dQ into an fp32 buffer from the 4-wave dK/dV pass.
 _BWD_DQ_MODE = "separate"
 
 
@@ -277,7 +301,7 @@ def _gated_mla_bwd(
         dq = dq_acc.to(q.dtype)
     else:
         dq = torch.empty(t, h, q.shape[-1], dtype=q.dtype, device=q.device)
-        _gated_mla_bwd_dkdv_bf16_opus(
+        _gated_mla_bwd_dkdv_pair_bf16_opus(
             q_k, k_nope, v, k_rot_k, d_o, lse, d, dkv, dk_rope, cu_seqlens, cu_seqlens, *args
         )
         _gated_mla_bwd_dq_bf16_opus(

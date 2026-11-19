@@ -92,6 +92,25 @@ constexpr int OFF_KT  = OFF_DST + 2 * BK * LD_T;
 constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KT;
 } // namespace gated_mla_bwd
 
+// dK / dV pass, 8 waves: the two waves of a SIMD (w, w + 4) share 32 keys and split the work by
+// dependency chain (S wave: S^T, P, dV; dP wave: dP^T, dS, dK). Takes gated_mla_bwd_kargs
+// (n_kv_blocks counted in BK = 128); ptr_dq_acc is unused.
+namespace gated_mla_bwd_pair {
+constexpr int BK = 128;  // keys per workgroup
+constexpr int NW = 8;    // waves
+constexpr int NP = 4;    // wave pairs (w, w + 4), one per SIMD; pair p owns keys [32 p, 32 p + 32)
+constexpr int PR = BK / NP;
+constexpr int BQ = 32;   // queries per tile
+constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
+constexpr int BLOCK = NW * 64;
+constexpr int HG = 16;
+// LDS, bf16, double-buffered by query-tile parity: sQ [BQ][D_QK] (B of S^T; B of dK,
+// transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed), rows padded by 8 elements.
+constexpr int LD_Q = D_QK + 8, LD_DO = D_V + 8;
+constexpr int OFF_Q = 0, OFF_DO = OFF_Q + 2 * BQ * LD_Q;
+constexpr int SMEM_ELEMS = OFF_DO + 2 * BQ * LD_DO;
+} // namespace gated_mla_bwd_pair
+
 // dQ pass without atomics, one workgroup per (query block of 256, sequence, head). Each wave
 // keeps its 32 queries' Q, dO and dQ in registers and walks the keys in tiles of 32,
 // recomputing S = Q K^T, P, dP = dO V^T and dS = P (dP - D) to accumulate dQ = dS K. Writes

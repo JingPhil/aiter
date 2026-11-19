@@ -60,6 +60,22 @@ void gated_mla_bwd_dkdv_bf16_opus(at::Tensor& q,
                                   bool causal,
                                   float softmax_scale);
 
+// As gated_mla_bwd_dkdv_bf16_opus, on the 8-wave kernel whose wave pairs split by dependency chain.
+void gated_mla_bwd_dkdv_pair_bf16_opus(at::Tensor& q,
+                                       at::Tensor& k_nope,
+                                       at::Tensor& v,
+                                       at::Tensor& k_rot,
+                                       at::Tensor& d_o,
+                                       at::Tensor& lse,
+                                       at::Tensor& d,
+                                       at::Tensor& dkv,
+                                       at::Tensor& dk_rope,
+                                       at::Tensor& seqstart_q,
+                                       at::Tensor& seqstart_k,
+                                       int max_seqlen_k,
+                                       bool causal,
+                                       float softmax_scale);
+
 // dQ pass, no atomics: inputs as the main pass, output dq [total_q, H, 192] bf16 (written,
 // not accumulated), including softmax_scale. max_seqlen_q sizes the grid.
 void gated_mla_bwd_dq_bf16_opus(at::Tensor& q,
