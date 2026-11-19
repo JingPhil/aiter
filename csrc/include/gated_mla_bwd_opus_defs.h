@@ -91,3 +91,47 @@ constexpr int OFF_DST = OFF_DO + 2 * BQ * LD_DO;
 constexpr int OFF_KT  = OFF_DST + 2 * BK * LD_T;
 constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KT;
 } // namespace gated_mla_bwd
+
+// dQ pass without atomics, one workgroup per (query block of 256, sequence, head). Each wave
+// keeps its 32 queries' Q, dO and dQ in registers and walks the keys in tiles of 32,
+// recomputing S = Q K^T, P, dP = dO V^T and dS = P (dP - D) to accumulate dQ = dS K. Writes
+// dq [total_q, H, 192] bf16 once, softmax_scale included; with it the main pass skips dQ.
+struct gated_mla_bwd_dq_kargs {
+    const void* __restrict__ ptr_q;
+    const void* __restrict__ ptr_k_nope;
+    const void* __restrict__ ptr_v;
+    const void* __restrict__ ptr_k_rot;
+    const void* __restrict__ ptr_do;
+    const float* __restrict__ ptr_lse;
+    const float* __restrict__ ptr_d;
+    void* __restrict__ ptr_dq;
+    const int* __restrict__ ptr_seqstart_q;
+    const int* __restrict__ ptr_seqstart_k;
+    int H;
+    int num_seqs;
+    int n_q_blocks;  // per sequence, from max_seqlen_q
+    int stride_q_n, stride_q_h;
+    int stride_k_n, stride_k_h;
+    int stride_v_n, stride_v_h;
+    int stride_k_rot_n;
+    int stride_do_n, stride_do_h;
+    int stride_lse_h;  // LSE and D share [H, total_q]
+    int stride_dq_n, stride_dq_h;
+    float softmax_scale;
+    int causal;
+};
+
+namespace gated_mla_bwd_dq {
+constexpr int NW = 8;          // waves
+constexpr int WQ = 32;         // queries per wave
+constexpr int BQ = NW * WQ;    // queries per workgroup
+constexpr int KC = 32;         // keys per tile
+constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
+constexpr int BLOCK = NW * 64;
+constexpr int HG = 16;         // heads per scheduling group, as in the main pass
+// LDS, bf16, double-buffered key tiles: sK [KC][D_QK] (B of S; B of dQ, transposed) and
+// sV [KC][D_V] (B of dP), rows padded by 8 elements.
+constexpr int LD_K = D_QK + 8, LD_V = D_V + 8;
+constexpr int OFF_K = 0, OFF_V = 2 * KC * LD_K;
+constexpr int SMEM_ELEMS = OFF_V + 2 * KC * LD_V;
+} // namespace gated_mla_bwd_dq

@@ -154,6 +154,95 @@ def _gated_mla_bwd_bf16_opus(
 ) -> None: ...
 
 
+def _gated_mla_bwd_dkdv_bf16_opus_fake(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None:
+    return None
+
+
+# The main pass without dQ: writes `dkv` and `dk_rope` in place.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_dkdv_bf16_opus",
+    gen_fake=_gated_mla_bwd_dkdv_bf16_opus_fake,
+)
+def _gated_mla_bwd_dkdv_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
+def _gated_mla_bwd_dq_bf16_opus_fake(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None:
+    return None
+
+
+# The dQ pass: writes `dq` (bf16) in place, no atomics.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_dq_bf16_opus",
+    gen_fake=_gated_mla_bwd_dq_bf16_opus_fake,
+)
+def _gated_mla_bwd_dq_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
+# How the backward computes dQ: "separate" runs a dQ pass after the dK/dV pass, "atomic" adds
+# dQ into an fp32 buffer from the dK/dV pass.
+_BWD_DQ_MODE = "separate"
+
+
 def _gated_mla_bwd(
     q: Tensor,
     kv: Tensor,
@@ -175,27 +264,26 @@ def _gated_mla_bwd(
     t, h, _ = q.shape
     d_nope = q.shape[-1] - k_rot.shape[-1]
     d_o, dgate, d = _gated_mla_bwd_pre(dout, out, gate)
-    dq_acc = torch.zeros(t, h, q.shape[-1], dtype=torch.float32, device=q.device)
+    q_k, k_rot_k = _kernel_ready(q), _kernel_ready(k_rot)
+    k_nope, v = kv[..., :d_nope], kv[..., d_nope:]
     dkv = torch.empty(t, h, kv.shape[-1], dtype=q.dtype, device=q.device)
     dk_rope = torch.empty(t, h, k_rot.shape[-1], dtype=torch.float32, device=q.device)
-    _gated_mla_bwd_bf16_opus(
-        _kernel_ready(q),
-        kv[..., :d_nope],
-        kv[..., d_nope:],
-        _kernel_ready(k_rot),
-        d_o,
-        lse,
-        d,
-        dq_acc,
-        dkv,
-        dk_rope,
-        cu_seqlens,
-        cu_seqlens,
-        int(max_seqlen),
-        bool(causal),
-        float(softmax_scale),
-    )
-    return dq_acc.to(q.dtype), dkv, dk_rope.sum(1).to(k_rot.dtype), dgate
+    args = (int(max_seqlen), bool(causal), float(softmax_scale))
+    if _BWD_DQ_MODE == "atomic":
+        dq_acc = torch.zeros(t, h, q.shape[-1], dtype=torch.float32, device=q.device)
+        _gated_mla_bwd_bf16_opus(
+            q_k, k_nope, v, k_rot_k, d_o, lse, d, dq_acc, dkv, dk_rope, cu_seqlens, cu_seqlens, *args
+        )
+        dq = dq_acc.to(q.dtype)
+    else:
+        dq = torch.empty(t, h, q.shape[-1], dtype=q.dtype, device=q.device)
+        _gated_mla_bwd_dkdv_bf16_opus(
+            q_k, k_nope, v, k_rot_k, d_o, lse, d, dkv, dk_rope, cu_seqlens, cu_seqlens, *args
+        )
+        _gated_mla_bwd_dq_bf16_opus(
+            q_k, k_nope, v, k_rot_k, d_o, lse, d, dq, cu_seqlens, cu_seqlens, *args
+        )
+    return dq, dkv, dk_rope.sum(1).to(k_rot.dtype), dgate
 
 
 def _kernel_ready(x: Tensor) -> Tensor:
