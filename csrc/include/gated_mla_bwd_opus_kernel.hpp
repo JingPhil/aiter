@@ -778,11 +778,13 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
     const bf16_t* kr_ptr = reinterpret_cast<const bf16_t*>(k.ptr_k_rot) + static_cast<long long>(k0) * k.stride_k_rot_n;
     const bf16_t* v_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_v) + static_cast<long long>(k0) * k.stride_v_n +
                           static_cast<long long>(h) * k.stride_v_h;
-    // Per load round u, wave-uniform: source pointer, row bytes, place in the buffer; and this
-    // lane's source offset within the tile. A wave without a load in its last round repeats its
-    // previous one, the same bytes to the same place, so that no round takes a branch.
-    const bf16_t* d_ptr[JU];
+    // Per load round u, wave-uniform: buffer descriptor of the next tile to load (its base and
+    // size), row bytes, place in the buffer and m0 for the next tile; and this lane's source offset
+    // within the tile. A wave without a load in its last round repeats its previous one, the same
+    // bytes to the same place, so that no round takes a branch.
+    gated_mla_bwd::i32x4_t d_rs[JU];
     int d_rb[JU], d_lds[JU], d_os[JU];
+    unsigned int d_m0[JU];
 #pragma unroll
     for(int u = 0; u < JU; u++)
     {
@@ -791,34 +793,48 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
         const int jj  = reg == 0 ? j : (reg == 1 ? j - J_N : j - J_N - J_R);
         const int rs  = reg == 0 ? k.stride_k_n : (reg == 1 ? k.stride_k_rot_n : k.stride_v_n);
         d_rb[u]       = rs * 2;
-        d_ptr[u]      = reg == 0 ? kn_ptr : (reg == 1 ? kr_ptr : v_ptr);
+        d_rs[u]       = gated_mla_bwd::dma_rsrc(reg == 0 ? kn_ptr : (reg == 1 ? kr_ptr : v_ptr), 0);
         d_lds[u]      = (reg == 0 ? OFF_KN : (reg == 1 ? OFF_KR : OFF_V)) * 2 + jj * 1024;
         const int spr = reg == 0 ? SPR_N : (reg == 1 ? SPR_R : SPR_V);
         const int dch = reg == 0 ? D_NOPE / 8 : (reg == 1 ? D_ROT / 8 : D_V / 8);
         const int sl = 64 * jj + lane, c = sl % spr;
         d_os[u]      = c < dch ? sl / spr * d_rb[u] + c * 16 : OOB;
     }
-    // Round u of a tile's DMA: `rows` keys into the buffer at LDS address lb. Tiles go in order, so
-    // the source pointer just advances. Rounds past the last tile fill a buffer no one reads
-    // anymore (with zeros past seqlen_k).
     // Key rows of tile t, in SALU: the compiler would clamp with v_med3 and move the result back
     // with a readfirstlane, which waits behind the other wave's VALU work.
-    auto dma_rows  = [&](int t) {
+    auto dma_rows = [&](int t) {
         int r = seqlen_k - t * KC;
         asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(KC));
         return r;
     };
-    auto dma_lds   = [&](int t) { return gated_mla_bwd::lds_addr(smem + t % NBUF * SZ_BUF); };
-    auto dma_round = [&](int rows, unsigned int lb, int u) {
-        auto rs = gated_mla_bwd::dma_rsrc(d_ptr[u], 0);
-        asm("s_mul_i32 %0, %1, %2" : "=s"(rs[2]) : "s"(rows), "s"(d_rb[u]));
-        gated_mla_bwd::dma16(rs, d_os[u], lb + d_lds[u]);
-        d_ptr[u] += KC * d_rb[u] / 2;
-    };
-    auto dma = [&](int t) {
+    auto dma_lds = [&](int t) { return gated_mla_bwd::lds_addr(smem + static_cast<unsigned int>(t) % NBUF * SZ_BUF); };
+    // Point the descriptors and m0 of every round at tile t (`adv`: from tile t - 1, whose base
+    // they hold). Tiles go in order, so the base just advances; tiles past the last one get size
+    // 0 and fill a buffer no one reads anymore with zeros, as do keys past seqlen_k. Made in an N
+    // stage and pinned, so that a C stage's round is only m0 and the load.
+    auto dma_next = [&](int t, bool adv) {
+        const int rows        = dma_rows(t);
+        const unsigned int lb = dma_lds(t);
 #pragma unroll
         for(int u = 0; u < JU; u++)
-            dma_round(dma_rows(t), dma_lds(t), u);
+        {
+            auto& r = d_rs[u];
+            unsigned long long p =
+                static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
+            if(adv)
+                p += static_cast<unsigned long long>(static_cast<unsigned int>(KC * d_rb[u]));
+            int n;
+            asm("s_mul_i32 %0, %1, %2" : "=s"(n) : "s"(rows), "s"(d_rb[u]));
+            r       = gated_mla_bwd::i32x4_t{static_cast<int>(p), static_cast<int>(p >> 32), n, 0x00020000};
+            d_m0[u] = lb + d_lds[u];
+            asm volatile("" : "+s"(r), "+s"(d_m0[u]));
+        }
+    };
+    auto dma_round = [&](int u) { gated_mla_bwd::dma16(d_rs[u], d_os[u], d_m0[u]); };
+    auto dma       = [&] {
+#pragma unroll
+        for(int u = 0; u < JU; u++)
+            dma_round(u);
     };
     // The DMA writes land in LDS when vmcnt says so, which s_barrier does not wait for.
     auto dma_wait = [] { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); };
@@ -849,7 +865,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
     const int o_kn = lane_b(number<LD_KN>{}), o_kr = lane_b(number<LD_KR>{}), o_v = lane_b(number<LD_V>{});
     const int o_tn = gated_mla_bwd::tr_c_order_lane<LD_KN>(lane), o_tr = gated_mla_bwd::tr_c_order_lane<LD_KR>(lane);
     auto addr = [&](int t, int off, int o) {
-        unsigned int a = gated_mla_bwd::lds_addr(smem + t % NBUF * SZ_BUF + off) + o * 2;
+        unsigned int a = gated_mla_bwd::lds_addr(smem + static_cast<unsigned int>(t) % NBUF * SZ_BUF + off) + o * 2;
         pin(a);
         return a;
     };
@@ -940,7 +956,9 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
     const int T            = n_kv_tiles;
 
     // N1: the first steps of C2 (and its addresses); P = exp(S(t) - LSE), in place in v_s.
-    auto n1 = [&](int t, int tp) {
+    auto n1 = [&](int t) {
+        int tp = t;  // max(t - 1, 0) in SALU, not a clamped VALU subtract
+        asm volatile("s_sub_i32 %0, %0, 1\n\ts_max_i32 %0, %0, 0" : "+s"(tp));
         a_v  = addr(t, OFF_V, o_v);
         a_tr = addr(tp, OFF_KR, o_tr);
         prefetch(ld_dp);
@@ -994,15 +1012,19 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
 #pragma unroll
         for(int r = 0; r < LA; r++)
             pin(ring[r]);
+        dma_next(t + 3, true);
     };
 
     // Tiles 0 and 1 in LDS, and Q, dO, LSE, D in registers, before the loop (0x0f70 is
     // s_waitcnt vmcnt(0)): otherwise the compiler waits for the latter inside the loop with
     // vmcnt counts that the DMA then makes block.
+    dma_next(0, false);
     if(T > 0)
-        dma(0);
+        dma();
+    dma_next(1, true);
     if(T > 1)
-        dma(1);
+        dma();
+    dma_next(2, true);
     __builtin_amdgcn_s_waitcnt(0x0f70);
     dma_wait();
     stage_end();
@@ -1015,16 +1037,17 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
         a_kr = addr(0, OFF_KR, o_kr);
         a_tn = addr(0, OFF_KN, o_tn);
         prefetch(ld_s);
-        for(int t = 0; t < T; t++)
+        // The tile index goes through an empty asm and the loop test is made before the N2 barrier:
+        // otherwise the compiler derives counters from it and updates them, and tests, after that
+        // barrier, in front of C1's first MFMA.
+        for(int t = 0;;)
         {
-            const int tp = t > 0 ? t - 1 : 0;
             // C1: S(t), then dQ(t - 1) on chunks 0, 1. Steps 1 .. JU also issue the DMA of tile
-            // t + 2, a round each, beside their MFMAs; tile t + 1's, issued a tile ago, is waited
-            // for first. All waves have waited for their share of tile t + 1 by the barrier that
-            // ends the lagging waves' C1, before any N2 reads it. Buffer (t + 2) % NBUF last held
-            // tile t - 2, whose dQ every wave finished in the stage before this one.
-            const int r2          = dma_rows(t + 2);
-            const unsigned int l2 = dma_lds(t + 2);
+            // t + 2 (set up in the N2 stage before), a round each, beside their MFMAs; tile t + 1's,
+            // issued a tile ago, is waited for first. All waves have waited for their share of
+            // tile t + 1 by the barrier that ends the lagging waves' C1, before any N2 reads it.
+            // Buffer (t + 2) % NBUF last held tile t - 2, whose dQ every wave finished in the stage
+            // before this one.
             c_stage(number<KS_S + 2>{},
                     [&](int st) { return st < KS_S ? ld_s(st) : ld_dq(st - KS_S); },
                     [&](int st, const frag_t& b) {
@@ -1035,11 +1058,11 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
                         if(st == 1)
                             dma_wait();
                         if(st >= 1 && st <= JU)
-                            dma_round(r2, l2, st - 1);
+                            dma_round(st - 1);
                     });
             pin(v_s);
             stage_end();
-            n1(t, tp);
+            n1(t);
             stage_end();
             // C2: dP(t), then dQ(t - 1) on chunks 2 .. 5.
             c_stage(number<KS_P + NQC - 2>{},
@@ -1053,7 +1076,13 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             pin(v_dp);
             stage_end();
             n2(t);
+            int tn = t + 1;
+            asm volatile("" : "+s"(tn));
+            const bool more = tn < T;
             stage_end();
+            if(!more)
+                break;
+            t = tn;
         }
         // Tail: dQ of the last tile.
         c_stage(number<NQC>{}, ld_dq, ex_dq);
@@ -1186,6 +1215,9 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     constexpr int J_Q = BQ * SPR_Q / 64, J_D = BQ * SPR_D / 64, JS = 4, JP = 3, JU = JS;
     static_assert(BQ * SPR_Q % 64 == 0 && BQ * SPR_D % 64 == 0, "whole loads per tensor");
     static_assert(NP * (JS + JP - 1) >= J_Q + J_D && NP * (JS + JP - 2) < J_Q + J_D && NP >= 2, "the load split");
+    // MFMA steps between a wave's rounds: back to back, each m0 write waits for the previous load
+    // to leave the CU's queue, which the other SIMDs' rounds fill at the same time.
+    constexpr int SP_S = 2, SP_P = 3;
     constexpr int OOB = 1 << 30;  // byte offset past any tile
     const char* q_src  = reinterpret_cast<const char*>(reinterpret_cast<const bf16_t*>(k.ptr_q) +
                                                       static_cast<long long>(q0) * k.stride_q_n +
@@ -1195,11 +1227,12 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                                                        static_cast<long long>(h) * k.stride_do_h);
     const char* l_src  = reinterpret_cast<const char*>(k.ptr_lse + static_cast<long long>(h) * k.stride_lse_h + q0);
     const char* d_src  = reinterpret_cast<const char*>(k.ptr_d + static_cast<long long>(h) * k.stride_lse_h + q0);
-    // Per load round u, wave-uniform: source pointer (advanced a tile per round, tiles going in
-    // order), row bytes, whether a 4-byte load, place in the buffer; and this lane's source
-    // offset within the tile.
-    const char* d_ptr[JU];
+    // Per load round u, wave-uniform: buffer descriptor of the next tile to load (its base and
+    // size), row bytes, whether a 4-byte load, place in the buffer and m0 for the next tile; and
+    // this lane's source offset within the tile.
+    gated_mla_bwd::i32x4_t d_rs[JU];
     int d_rb[JU], d_lds[JU], d_os[JU];
+    unsigned int d_m0[JU];
 #pragma unroll
     for(int u = 0; u < JU; u++)
     {
@@ -1209,8 +1242,9 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         const int reg = !s_wave && u == JP - 1 ? 2 + (w - NP) % 2 : (jl < J_Q ? 0 : 1);
         const int jj  = reg == 0 ? jl : jl - J_Q;
         d_rb[u]       = reg == 0 ? k.stride_q_n * 2 : (reg == 1 ? k.stride_do_n * 2 : 4);
-        d_ptr[u]      = (reg == 0 ? q_src : (reg == 1 ? do_src : (reg == 2 ? l_src : d_src))) +
-                   static_cast<long long>(i0) * BQ * d_rb[u];
+        d_rs[u]       = gated_mla_bwd::dma_rsrc((reg == 0 ? q_src : (reg == 1 ? do_src : (reg == 2 ? l_src : d_src))) +
+                                                    static_cast<long long>(i0) * BQ * d_rb[u],
+                                                0);
         d_lds[u] = reg == 0 ? OFF_Q * 2 + jj * 1024 : (reg == 1 ? OFF_DO * 2 + jj * 1024 : (reg == 2 ? OFF_LSE : OFF_D) * 2);
         const int spr = reg == 0 ? SPR_Q : SPR_D, dch = reg == 0 ? D_QK / 8 : D_V / 8;
         const int sl = 64 * jj + lane, c = sl % spr;
@@ -1223,27 +1257,55 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(BQ));
         return r;
     };
-    // Buffers go round in tile order; b is a tile's buffer.
-    auto bnext   = [](int b) { return b + 1 == NBUF ? 0 : b + 1; };
-    auto bprev   = [](int b) { return b == 0 ? NBUF - 1 : b - 1; };
-    auto dma_lds = [&](int b) { return gated_mla_bwd::lds_addr(smem + b * SZ_BUF); };
-    // Round u of a tile's DMA, `rows` queries into the buffer at LDS address lb. Rounds past the
-    // last tile fill a buffer no one reads anymore, with zeros.
-    // The role is a type (dp_c) and u is a constant once unrolled, so no round takes a branch.
-    auto dma_round = [&](int rows, unsigned int lb, int u, auto dp_c) {
-        auto rs = gated_mla_bwd::dma_rsrc(d_ptr[u], 0);
-        asm("s_mul_i32 %0, %1, %2" : "=s"(rs[2]) : "s"(rows), "s"(d_rb[u]));
-        if(decltype(dp_c)::value && u == JP - 1)
-            gated_mla_bwd::dma4(rs, d_os[u], lb + d_lds[u]);
-        else
-            gated_mla_bwd::dma16(rs, d_os[u], lb + d_lds[u]);
-        d_ptr[u] += BQ * d_rb[u];
+    // Buffers go round in tile order; b is a tile's buffer. In SALU: the compiler would step back
+    // with a VALU subtract and a readfirstlane.
+    auto bnext = [](int b) {
+        int r;
+        asm("s_add_i32 %0, %1, 1\n\ts_cmp_eq_u32 %0, %2\n\ts_cselect_b32 %0, 0, %0" : "=&s"(r) : "s"(b), "n"(NBUF) : "scc");
+        return r;
     };
-    auto dma = [&](int t, int b, auto dp_c) {
+    auto bprev = [](int b) {
+        int r;
+        asm("s_add_i32 %0, %1, -1\n\ts_cmp_lt_i32 %0, 0\n\ts_cselect_b32 %0, %2, %0" : "=&s"(r) : "s"(b), "n"(NBUF - 1) : "scc");
+        return r;
+    };
+    auto dma_lds = [&](int b) { return gated_mla_bwd::lds_addr(smem + b * SZ_BUF); };
+    // Point this wave's rounds (dp_c: the dP waves' JP, else JS) at tile t in buffer b (`adv`:
+    // from tile t - 1, whose base they hold). Tiles go in order, so the base just advances; tiles
+    // past the last one fill a buffer no one reads anymore, with zeros, as do queries past
+    // seqlen_q. Made in the wave's VALU stage and pinned, so that a round in its MFMA stage is
+    // only m0 and the load.
+    auto dma_next = [&](int t, int b, bool adv, auto dp_c) {
+        constexpr int n       = decltype(dp_c)::value ? JP : JS;
+        const int rows        = dma_rows(t);
+        const unsigned int lb = dma_lds(b);
+#pragma unroll
+        for(int u = 0; u < n; u++)
+        {
+            auto& r = d_rs[u];
+            unsigned long long p =
+                static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
+            if(adv)
+                p += static_cast<unsigned long long>(static_cast<unsigned int>(BQ * d_rb[u]));
+            int nb;
+            asm("s_mul_i32 %0, %1, %2" : "=s"(nb) : "s"(rows), "s"(d_rb[u]));
+            r       = gated_mla_bwd::i32x4_t{static_cast<int>(p), static_cast<int>(p >> 32), nb, 0x00020000};
+            d_m0[u] = lb + d_lds[u];
+            asm volatile("" : "+s"(r), "+s"(d_m0[u]));
+        }
+    };
+    // The role is a type (dp_c) and u is a constant once unrolled, so no round takes a branch.
+    auto dma_round = [&](int u, auto dp_c) {
+        if(decltype(dp_c)::value && u == JP - 1)
+            gated_mla_bwd::dma4(d_rs[u], d_os[u], d_m0[u]);
+        else
+            gated_mla_bwd::dma16(d_rs[u], d_os[u], d_m0[u]);
+    };
+    auto dma = [&](auto dp_c) {
         constexpr int n = decltype(dp_c)::value ? JP : JS;
 #pragma unroll
         for(int u = 0; u < n; u++)
-            dma_round(dma_rows(t), dma_lds(b), u, dp_c);
+            dma_round(u, dp_c);
     };
     // The DMA writes land in LDS when vmcnt says so, which s_barrier does not wait for.
     auto dma_wait  = [] { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); };
@@ -1256,12 +1318,13 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     // empty asm that reads and writes them), so the compiler cannot sink their computation into
     // the next stage and keep the inputs live across it.
     auto pin = [](auto& x) { asm volatile("" : "+v"(x)); };
-    // The same for the DMA's source pointers, advanced in an MFMA stage, so that the adds stay there.
-    auto pin_dma = [](const char* (&ptr)[JU], int n_rounds) {
-#pragma unroll
-        for(int u = 0; u < JU; u++)
-            if(u < n_rounds)
-                asm volatile("" : "+s"(ptr[u]));
+    // Each wave's loop: the tile index goes through an empty asm and the loop test is made before
+    // the barrier that closes a tile, so that the compiler derives no counters from it to update
+    // and test after that barrier, in front of the next stage.
+    auto next_tile = [&](int t) {
+        int tn = t + 1;
+        asm volatile("" : "+s"(tn));
+        return tn;
     };
 
     // Query tile fragments are read at a per-lane LDS address plus immediates. The address of an
@@ -1343,15 +1406,20 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     // The first tiles in LDS (the dP waves' shares up to i0 + 2, as they issue tile t + 3 from
     // B(t)) and this wave's K or V in registers before the loop (0x0f70 is s_waitcnt vmcnt(0)):
     // otherwise the compiler waits for the latter inside the loop with vmcnt counts that the DMA
-    // then makes block.
+    // then makes block. The S waves' rounds are then pointed at tile i0 + 2 for A(i0).
     const int b0 = i0 % NBUF;
     auto prologue = [&](auto dp_c) {
-        if(i0 < T)
+        constexpr int n = decltype(dp_c)::value ? 3 : 2;
+        int b           = b0;
+#pragma unroll
+        for(int x = 0; x < n; x++, b = bnext(b))
         {
-            int b = b0;
-            for(int x = 0; x < (decltype(dp_c)::value ? 3 : 2); x++, b = bnext(b))
-                dma(i0 + x, b, dp_c);
+            dma_next(i0 + x, b, x > 0, dp_c);
+            if(i0 < T)
+                dma(dp_c);
         }
+        if(!decltype(dp_c)::value)
+            dma_next(i0 + n, b, true, dp_c);
         __builtin_amdgcn_s_waitcnt(0x0f70);
         dma_wait();
         stage_end();
@@ -1403,16 +1471,14 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
             a_tdo = addr(b0, OFF_DO, o_tdo);
             prefetch(ld_q);
             int bt = b0;  // tile t's buffer
-            for(int t = i0; t < T; t++, bt = bnext(bt))
+            for(int t = i0;;)
             {
-                const int qt0         = t * BQ;
-                const int b1          = bnext(bt);
-                const int r2          = dma_rows(t + 2);
-                const unsigned int l2 = dma_lds(bnext(b1));
-                // A(t): S^T(t), then dV(t - 1). Steps 1 .. JS also issue this wave's share of tile
-                // t + 2, a round each, beside their MFMAs; its share of tile t + 1, issued a tile
-                // ago, is waited for first, before B(t) reads it. Buffer (t + 2) % NBUF last held
-                // tile t - 3.
+                const int qt0 = t * BQ;
+                // A(t): S^T(t), then dV(t - 1). Steps 1, 1 + SP_S, .. also issue this wave's share
+                // of tile t + 2 (set up in B(t - 1)), a round each, beside their MFMAs; its share
+                // of tile t + 1, issued a tile ago, is waited for first, before B(t) reads it.
+                // Buffer (t + 2) % NBUF last held tile t - 3.
+                static_assert(1 + SP_S * (JS - 1) < KS + NV, "every round in the stage");
                 c_stage(number<KS + NV>{},
                         [&](int st) { return st < KS ? ld_q(st) : ld_tdo(st - KS); },
                         [&](int st, const frag_t& b) {
@@ -1422,20 +1488,22 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                                 ex_dv(st - KS, b);
                             if(st == 1)
                                 dma_wait();
-                            if(st >= 1 && st <= JS)
-                                dma_round(r2, l2, st - 1, std::false_type{});
+                            if(st >= 1 && (st - 1) % SP_S == 0 && (st - 1) / SP_S < JS)
+                                dma_round((st - 1) / SP_S, std::false_type{});
                         });
                 pin(v_s);
-                pin_dma(d_ptr, JS);
                 stage_end();
                 // B(t): LSE, read ahead of the next A stage's first steps (S^T(t + 1); past the
                 // last tile they read a buffer the tail does not use) so as not to wait behind
                 // them; P(t), as in the main pass: tiles this pair sees in full take an unmasked exp.
+                // Also this wave's rounds of tile t + 3, in buffer (t + 3) % NBUF = (t - 2) % NBUF.
+                const int b1 = bnext(bt);
                 float lse_e[NS];
                 ld_runs(bt, OFF_LSE, LOG2_E, lse_e);
                 a_tdo = addr(bt, OFF_DO, o_tdo);
                 a_q   = addr(b1, OFF_Q, o_q);
                 prefetch(ld_q);
+                dma_next(t + 3, bprev(bprev(bt)), true, std::false_type{});
                 // Each float4 of P goes to LDS as soon as its exps are done, the next exps issuing
                 // while it waits in the LDS queue: four writes back to back wait there in turn.
                 auto write_p = [&](int c) {
@@ -1474,7 +1542,13 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 p_bf = opus::cast<bf16_t>(v_s);
                 pin(p_bf);
                 pin_ring();
+                const int tn    = next_tile(t);
+                const bool more = tn < T;
                 stage_end();
+                if(!more)
+                    break;
+                t  = tn;
+                bt = b1;
             }
             // A': dV of the last tile. B': the dP waves' dK of it.
             prefetch(ld_tdo);
@@ -1546,25 +1620,27 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         prologue(std::true_type{});
         if(i0 < T)
         {
-            int bt = b0;  // tile t's buffer
-            for(int t = i0; t < T; t++, bt = bnext(bt))
+            int bt = b0, bp = b0;  // tile t's buffer, tile t - 1's (tile t's for the first)
+            for(int t = i0;;)
             {
-                const int bp = t > i0 ? bprev(bt) : bt;  // tile t - 1's (tile t's for the first)
-                // A(t): dS(t - 1), its LDS reads ahead of the first steps of B(t).
+                // A(t): dS(t - 1), its LDS reads ahead of the first steps of B(t). Also this
+                // wave's rounds of tile t + 3, in buffer (t + 3) % NBUF = (t - 2) % NBUF, and the
+                // next tile's buffer.
                 ds(bp, [&] {
                     a_do = addr(bt, OFF_DO, o_do);
                     a_tq = addr(bp, OFF_Q, o_tq);
                     prefetch(ld_do);
                 });
+                dma_next(t + 3, bprev(bprev(bt)), true, std::true_type{});
+                const int bn = bnext(bt);
                 pin(a_ds);
                 pin_ring();
                 stage_end();
-                // B(t): dP^T(t), then dK(t - 1). Steps 1 .. JP also issue this wave's share of tile
-                // t + 3, as the S waves do theirs of tile t + 2 in A(t); its share of tile t + 2,
-                // issued a tile ago, is waited for first, before B(t + 1) reads it. Buffer
-                // (t + 3) % NBUF last held tile t - 2, done with in A(t - 1) and B(t - 1).
-                const int r3          = dma_rows(t + 3);
-                const unsigned int l3 = dma_lds(bprev(bprev(bt)));
+                // B(t): dP^T(t), then dK(t - 1). Steps 1, 1 + SP_P, .. also issue this wave's
+                // share of tile t + 3, as the S waves do theirs of tile t + 2 in A(t); its share of
+                // tile t + 2, issued a tile ago, is waited for first, before B(t + 1) reads it.
+                // Buffer (t + 3) % NBUF last held tile t - 2, done with in A(t - 1) and B(t - 1).
+                static_assert(1 + SP_P * (JP - 1) < KS_P + NK, "every round in the stage");
                 c_stage(number<KS_P + NK>{},
                         [&](int st) { return st < KS_P ? ld_do(st) : ld_tq(st - KS_P); },
                         [&](int st, const frag_t& b) {
@@ -1574,12 +1650,18 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                                 ex_dk(st - KS_P, b);
                             if(st == 1)
                                 dma_wait();
-                            if(st >= 1 && st <= JP)
-                                dma_round(r3, l3, st - 1, std::true_type{});
+                            if(st >= 1 && (st - 1) % SP_P == 0 && (st - 1) / SP_P < JP)
+                                dma_round((st - 1) / SP_P, std::true_type{});
                         });
                 pin(v_dp);
-                pin_dma(d_ptr, JP);
+                const int tn    = next_tile(t);
+                const bool more = tn < T;
                 stage_end();
+                if(!more)
+                    break;
+                t  = tn;
+                bp = bt;
+                bt = bn;
             }
             // A': dS of the last tile and the first steps of B'. B': dK of it.
             const int bl = (T - 1) % NBUF;
