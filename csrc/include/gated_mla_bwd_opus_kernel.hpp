@@ -220,8 +220,53 @@ __device__ inline wg_ids wg_map_sgpr(int wg, int H, int num_seqs, int n_blocks, 
 }
 // dQ pass: load phases and compute phases, the VALU work behind the wave's own MFMAs (1), or the
 // MFMA stages C1, C2 and the VALU stages N1, N2 (0).
+#ifndef GMLA_X_PFIRST
+#define GMLA_X_PFIRST 0
+#endif
 #ifndef GMLA_DQ_PP
 #define GMLA_DQ_PP 0
+#endif
+// Pair pass: load phases and compute phases as the dQ pass's (1), or the stages A and B (0).
+#ifndef GMLA_PAIR_PP
+#define GMLA_PAIR_PP 0
+#endif
+// Timing experiments on the phased pair pass: a switch off its default leaves one kind of work out
+// of the loop (the results are then wrong), or moves it, to see what it costs in the phases' lengths.
+#ifndef GMLA_X_PW
+#define GMLA_X_PW 1  // the S wave writes P to LDS
+#endif
+#ifndef GMLA_X_PWPOS
+#define GMLA_X_PWPOS 0  // P's float4s 0 .. 3 in the S wave's load phases 1, 2, 3, 4 (0); 1, 2, 3, 3 (1); 1, 2, 2, 3 (2); 1, 2, 3, 5 (3)
+#endif
+#ifndef GMLA_X_PWMID
+#define GMLA_X_PWMID 0  // those writes right behind the phase's reads (1) or at its end (0)
+#endif
+#ifndef GMLA_X_PR
+#define GMLA_X_PR 1  // the dP wave reads P from LDS (0: from a register)
+#endif
+#ifndef GMLA_X_PRLAST
+#define GMLA_X_PRLAST 0  // that read after its phase's operand reads (1) or before them (0)
+#endif
+#ifndef GMLA_X_DMA
+#define GMLA_X_DMA 1  // the DMA rounds of the loop and their descriptors
+#endif
+#ifndef GMLA_X_RPH
+#define GMLA_X_RPH 3, 3, 3, 4, 1, 2, 4  // the dP wave's load phase (0 .. 4: a .. e) of each DMA round: 0 .. 2 Q, 3 Q or dO, 4, 5 dO, 6 LSE or D
+#endif
+#ifndef GMLA_X_D
+#define GMLA_X_D 1  // the dP wave reads D from LDS (0: its registers stay 0 and the subtractions go; 2: they stay, against registers the compiler knows nothing of)
+#endif
+#ifndef GMLA_X_RMASK
+#define GMLA_X_RMASK 127  // the DMA rounds that are issued (bit u: round u)
+#endif
+#ifndef GMLA_X_DSV
+#define GMLA_X_DSV 0  // the dP wave's VALU work: (dP - D) behind 8 MFMAs and P (dP - D) behind 16 (0), one instruction behind each MFMA (1), or as 1 with (dP - D) behind the second 8 MFMAs alone (2)
+#endif
+#ifndef GMLA_X_LSE
+#define GMLA_X_LSE 1  // the S wave reads LSE from LDS (0: from a register)
+#endif
+#ifndef GMLA_X_LOOPPIN
+#define GMLA_X_LOOPPIN 1  // the loop-carried scalars pinned ahead of the loop test
 #endif
 #if GMLA_DQ_PP && GMLA_DQ_QR_REG
 #error "GMLA_DQ_PP reads Q rope from sQR"
@@ -230,6 +275,13 @@ __device__ inline wg_ids wg_map_sgpr(int wg, int H, int num_seqs, int n_blocks, 
 // (__builtin_amdgcn_sched_group_barrier's: 0x002 VALU, 0x400 transcendental).
 #define GMLA_SCHED8(MASK, CNT)                                 \
     _Pragma("unroll") for(int i_ = 0; i_ < 8; i_++)            \
+    {                                                          \
+        __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);     \
+        __builtin_amdgcn_sched_group_barrier(MASK, CNT, 0);    \
+    }
+// As GMLA_SCHED8 for the 4 MFMAs of one step.
+#define GMLA_SCHED4(MASK, CNT)                                 \
+    _Pragma("unroll") for(int i_ = 0; i_ < 4; i_++)            \
     {                                                          \
         __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);     \
         __builtin_amdgcn_sched_group_barrier(MASK, CNT, 0);    \
@@ -857,7 +909,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
     // with a readfirstlane, which waits behind the other wave's VALU work.
     auto dma_rows = [&](int t) {
         int r = seqlen_k - t * KC;
-        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(KC));
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(KC) : "scc");
         return r;
     };
     auto dma_lds = [&](int t) { return gated_mla_bwd::lds_addr(smem + static_cast<unsigned int>(t) % NBUF * SZ_BUF); };
@@ -1054,7 +1106,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
     // N1: the first steps of C2 (and its addresses); P = exp(S(t) - LSE), in place in v_s.
     auto n1 = [&](int t) {
         int tp = t;  // max(t - 1, 0) in SALU, not a clamped VALU subtract
-        asm volatile("s_sub_i32 %0, %0, 1\n\ts_max_i32 %0, %0, 0" : "+s"(tp));
+        asm volatile("s_sub_i32 %0, %0, 1\n\ts_max_i32 %0, %0, 0" : "+s"(tp) : : "scc");
         a_v  = addr(t, OFF_V, o_v);
         a_tr = addr(tp, OFF_KR, o_tr);
 #if !GMLA_DQ_LPF
@@ -1183,6 +1235,31 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             v_s = mma_k1(ks < KS_N ? a_q(ks) : a_qr[ks - KS_N], b, ks == 0 ? zero : v_s);
         };
         static_assert(JU <= 3 && KS_S == 6 && KS_P == 4 && NQC == 6 && KS_R == 2, "phases as laid out below");
+        // One MFMA of S's nope K step ks: M tile tm against key half tn (mma_k1 runs the four in one
+        // call, which leaves their order, and what goes between them, to the compiler).
+        auto mma_11 = make_mma(number<1>{}, number<1>{}, number<1>{});
+        static_assert(decltype(mma_11)::tile_a_len == 8 && decltype(mma_11)::tile_c_len == 4);
+        auto xs1 = [&](int ks, int tm, int tn, const frag_t& b) {
+            opus::vector_t<bf16_t, 8> a1;
+            bvec<8> b1;
+            typename decltype(mma_11)::vtype_c c1{};
+#pragma unroll
+            for(int x = 0; x < 8; x++)
+            {
+                a1[x] = v_qw[(tm * KS_N + ks) * 8 + x];
+                b1[x] = b[tn * 8 + x];
+            }
+            if(ks != 0)
+            {
+#pragma unroll
+                for(int p_ = 0; p_ < 4; p_++)
+                    c1[p_] = v_s[(tm * 2 + tn) * 4 + p_];
+            }
+            c1 = mma_11(a1, b1, c1);
+#pragma unroll
+            for(int p_ = 0; p_ < 4; p_++)
+                v_s[(tm * 2 + tn) * 4 + p_] = c1[p_];
+        };
 
         // The descriptors hold tile 2 here. Per round: the bytes of a full tile and of the
         // sequence's last, partial one. For all rounds: the key rows from the descriptors' tile
@@ -1216,7 +1293,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             rl -= KC;
             lb += SZ_BUF * 2;
             unsigned int lw = lb - NBUF * SZ_BUF * 2;
-            asm volatile("s_cmp_ge_u32 %0, %2\n\ts_cselect_b32 %0, %1, %0" : "+s"(lb) : "s"(lw), "s"(lb_end));
+            asm volatile("s_cmp_ge_u32 %0, %2\n\ts_cselect_b32 %0, %1, %0" : "+s"(lb) : "s"(lw), "s"(lb_end) : "scc");
             asm volatile("" : "+s"(rl));
         };
         // Round u's descriptor and m0 to that tile: the base a tile further; the size a full tile's,
@@ -1229,7 +1306,8 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             int n = d_kb[u];
             asm volatile("s_cmp_ge_i32 %1, %3\n\ts_cselect_b32 %0, %0, %2\n\ts_cmp_gt_i32 %1, 0\n\ts_cselect_b32 %0, %0, 0"
                          : "+s"(n)
-                         : "s"(rl), "s"(d_np[u]), "n"(KC));
+                         : "s"(rl), "s"(d_np[u]), "n"(KC)
+                         : "scc");
             r       = gated_mla_bwd::i32x4_t{static_cast<int>(p), static_cast<int>(p >> 32), n, 0x00020000};
             d_m0[u] = lb + d_lds[u];
             asm volatile("" : "+s"(r), "+s"(d_m0[u]));
@@ -1242,7 +1320,8 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             asm volatile("s_cmp_lg_i32 %2, 0\n\ts_cselect_b32 %1, %1, %0\n\ts_min_i32 %0, %0, %1\n\t"
                          "s_cmp_gt_i32 %3, 0\n\ts_cselect_b32 %0, -1, %0"
                          : "+s"(kfm), "+s"(lim_c)
-                         : "s"(cz), "s"(qover));
+                         : "s"(cz), "s"(qover)
+                         : "scc");
         }
 
         a_kn = addr(0, OFF_KN, o_kn);
@@ -1252,20 +1331,29 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
         pin(v_dp);
         for(int t = 0;;)
         {
-            // 1: S steps 0, 1. The DMA of tile t + 1, issued a tile ago, is waited for here: every
-            // wave has waited for its share a tile before any wave reads it.
-            // Round 1's descriptor moves on to tile t + 2.
+            // 1: S steps 0, 1. Round 1's descriptor moves on to tile t + 2.
             op[0] = ld_s(0);
             op[1] = ld_s(1);
             __builtin_amdgcn_sched_barrier(0);
-            dma_wait();
             if(JU > 1)
                 adv_round(1);
             l_end();
-            xs(0, op[0]);
-            xs(1, op[1]);
-            a_ds = opus::cast<bf16_t>(v_dp);
-            GMLA_SCHED8(0x002, 1)
+            // Behind each MFMA, pinned and fenced there, one pack of dS(t - 1) to bf16: left to the
+            // compiler, the eight packs come after the sixth MFMA, into registers it had lent to S.
+            static_assert(NS == 16 && MR == 2);
+#pragma unroll
+            for(int i = 0; i < 8; i++)
+            {
+                xs1(i / 4, i / 2 % 2, i % 2, op[i / 4]);
+                const opus::vector_t<float, 2> f2{v_dp[2 * i], v_dp[2 * i + 1]};
+                auto h2 = opus::cast<bf16_t>(f2);
+                pin(h2);  // or the packs sink below the last MFMA
+                a_ds[2 * i]     = h2[0];
+                a_ds[2 * i + 1] = h2[1];
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+                __builtin_amdgcn_sched_group_barrier(0x002, 1, 0);
+                __builtin_amdgcn_sched_barrier(0);
+            }
             pin(v_s);
             pin(a_ds);
             c_end();
@@ -1286,7 +1374,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             xs(3, op[1]);
             {
                 int tp = t;
-                asm volatile("s_sub_i32 %0, %0, 1\n\ts_max_i32 %0, %0, 0" : "+s"(tp));
+                asm volatile("s_sub_i32 %0, %0, 1\n\ts_max_i32 %0, %0, 0" : "+s"(tp) : : "scc");
                 a_kn = addr(t + 1, OFF_KN, o_kn);
                 a_v  = addr(t, OFF_V, o_v);
                 a_tn = addr(tp, OFF_KN, o_tn);
@@ -1388,6 +1476,12 @@ __global__ __launch_bounds__(gated_mla_bwd_dq::BLOCK, 1) void gated_mla_bwd_dq_k
             // for the next tile's phase 1 (or the tail). The loop test is made before the barriers.
             op[0] = ld_dq(4);
             op[1] = ld_dq(5);
+            // The DMA of tile t + 1, issued a tile ago, is waited for here, in the last phase
+            // before any wave reads it, and by count: this wave's JU loads of tile t + 2 are
+            // still out. The memory path now and then stops for 1000 to 3600 cycles (ATT, in
+            // every kernel that loads from global memory); the loads have had 3600 by now.
+            __builtin_amdgcn_sched_barrier(0);
+            asm volatile("s_waitcnt vmcnt(%0)" : : "n"(JU) : "memory");
             int tn = t + 1;
             asm volatile("" : "+s"(tn));
             const bool more = tn < T;
@@ -1597,7 +1691,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dqds::BLOCK, 1) void gated_mla_bwd_dq
     auto dma_lds = [&](int b) { return gated_mla_bwd::lds_addr(smem + b * SZ_BUF); };
     auto dma     = [&](int kt, int b) {
         int rows = seqlen_k - kt * KC;
-        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(rows) : "n"(KC));
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(rows) : "n"(KC) : "scc");
         const unsigned int lb = dma_lds(b);
 #pragma unroll
         for(int u = 0; u < JK; u++)
@@ -1825,7 +1919,7 @@ __global__ __launch_bounds__(gated_mla_bwd_dq32::BLOCK, 1) void gated_mla_bwd_dq
     }
     auto dma_rows = [&](int t) {
         int r = seqlen_k - t * KC;
-        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(KC));
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(KC) : "scc");
         return r;
     };
     auto dma_lds   = [&](int t) { return gated_mla_bwd::lds_addr(smem + t % NBUF * SZ_BUF); };
@@ -2248,22 +2342,30 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     // with a readfirstlane, which waits behind the other wave's VALU work.
     auto dma_rows = [&](int t) {
         int r = seqlen_q - t * BQ;
-        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(BQ));
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(BQ) : "scc");
         return r;
     };
-    // Buffers go round in tile order; b is a tile's buffer. In SALU: the compiler would step back
-    // with a VALU subtract and a readfirstlane.
+    // Buffers go round in tile order; b is a tile's buffer, named by its offset in smem (elements):
+    // an index would take an s_mul_i32 for every address made from it, and a scalar multiply in
+    // one wave holds back the MFMA and VALU issue of the SIMD's other wave (see the dQ pass's
+    // phased loop). In SALU: the compiler would step back with a VALU subtract and a readfirstlane.
     auto bnext = [](int b) {
         int r;
-        asm("s_add_i32 %0, %1, 1\n\ts_cmp_eq_u32 %0, %2\n\ts_cselect_b32 %0, 0, %0" : "=&s"(r) : "s"(b), "n"(NBUF) : "scc");
+        asm("s_add_i32 %0, %1, %2\n\ts_cmp_eq_u32 %0, %3\n\ts_cselect_b32 %0, 0, %0"
+            : "=&s"(r)
+            : "s"(b), "n"(SZ_BUF), "n"(NBUF * SZ_BUF)
+            : "scc");
         return r;
     };
     auto bprev = [](int b) {
         int r;
-        asm("s_add_i32 %0, %1, -1\n\ts_cmp_lt_i32 %0, 0\n\ts_cselect_b32 %0, %2, %0" : "=&s"(r) : "s"(b), "n"(NBUF - 1) : "scc");
+        asm("s_add_i32 %0, %1, %2\n\ts_cmp_lt_i32 %0, 0\n\ts_cselect_b32 %0, %3, %0"
+            : "=&s"(r)
+            : "s"(b), "n"(-SZ_BUF), "n"((NBUF - 1) * SZ_BUF)
+            : "scc");
         return r;
     };
-    auto dma_lds = [&](int b) { return gated_mla_bwd::lds_addr(smem + b * SZ_BUF); };
+    auto dma_lds = [&](int b) { return gated_mla_bwd::lds_addr(smem + b); };
     // Point this wave's rounds (dp_c: the dP waves' JP, else JS) at tile t in buffer b (`adv`:
     // from tile t - 1, whose base they hold). Tiles go in order, so the base just advances; tiles
     // past the last one fill a buffer no one reads anymore, with zeros, as do queries past
@@ -2273,6 +2375,23 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         constexpr int n       = decltype(dp_c)::value ? JP : JS;
         const int rows        = dma_rows(t);
         const unsigned int lb = dma_lds(b);
+        // The sizes: a full tile's by a shift; only the sequence's last, partial tile and the
+        // tiles past it multiply.
+        int part = rows - BQ;
+        asm volatile("" : "+s"(part));
+        int nbs[JU];
+        if(__builtin_expect(part == 0, 1))
+        {
+#pragma unroll
+            for(int u = 0; u < n; u++)
+                nbs[u] = BQ * d_rb[u];
+        }
+        else
+        {
+#pragma unroll
+            for(int u = 0; u < n; u++)
+                asm("s_mul_i32 %0, %1, %2" : "=s"(nbs[u]) : "s"(rows), "s"(d_rb[u]));
+        }
 #pragma unroll
         for(int u = 0; u < n; u++)
         {
@@ -2281,8 +2400,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
             if(adv)
                 p += static_cast<unsigned long long>(static_cast<unsigned int>(BQ * d_rb[u]));
-            int nb;
-            asm("s_mul_i32 %0, %1, %2" : "=s"(nb) : "s"(rows), "s"(d_rb[u]));
+            const int nb = nbs[u];
             r       = gated_mla_bwd::i32x4_t{static_cast<int>(p), static_cast<int>(p >> 32), nb, 0x00020000};
             d_m0[u] = lb + d_lds[u];
             asm volatile("" : "+s"(r), "+s"(d_m0[u]));
@@ -2333,7 +2451,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         return opus::layout_to_offsets<8>(lay_b(ld, c_ab))[0] - opus::layout_to_offsets<8>(lay_b(ld, c_0))[0];
     };
     auto addr = [&](int b, int off, int o) {
-        unsigned int a = gated_mla_bwd::lds_addr(smem + b * SZ_BUF + off) + o * 2;
+        unsigned int a = gated_mla_bwd::lds_addr(smem + b + off) + o * 2;
         pin(a);
         return a;
     };
@@ -2342,7 +2460,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     // 16 tn + 4 (lane / 16) + p of the tile, so each N tile is one float4 run of LSE or D, and P
     // goes to the dP wave in that layout, chunk-major so that each float4 access is lane-contiguous.
     auto ld_runs = [&](int b, int off, float mul, float(&out)[NS]) {
-        const float* f = reinterpret_cast<const float*>(smem + b * SZ_BUF + off);
+        const float* f = reinterpret_cast<const float*>(smem + b + off);
         f32x4_t run[NT];
 #pragma unroll
         for(int tn = 0; tn < NT; tn++)
@@ -2401,7 +2519,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
     // B(t)) and this wave's K or V in registers before the loop (0x0f70 is s_waitcnt vmcnt(0)):
     // otherwise the compiler waits for the latter inside the loop with vmcnt counts that the DMA
     // then makes block. The S waves' rounds are then pointed at tile i0 + 2 for A(i0).
-    const int b0 = i0 % NBUF;
+    const int b0 = i0 % NBUF * SZ_BUF;
     auto prologue = [&](auto dp_c) {
         constexpr int n = decltype(dp_c)::value ? 3 : 2;
         int b           = b0;
@@ -2412,13 +2530,73 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
             if(i0 < T)
                 dma(dp_c);
         }
+#if !GMLA_PAIR_PP
         if(!decltype(dp_c)::value)
             dma_next(i0 + n, b, true, dp_c);
+#endif
         __builtin_amdgcn_s_waitcnt(0x0f70);
         dma_wait();
         stage_end();
     };
 
+#if GMLA_PAIR_PP
+    // One MFMA of a step, M tile m against N tile n (mma_k1 runs the four in one call, which
+    // leaves their order, and what goes between them, to the compiler): for the phases that put
+    // one pack to bf16 behind each MFMA. Left to the compiler, the eight packs come after the
+    // sixth MFMA, into registers it had lent to the step's operands.
+    auto mma_11 = make_mma(number<1>{}, number<1>{}, number<1>{});
+    static_assert(decltype(mma_11)::tile_a_len == 8 && decltype(mma_11)::tile_c_len == 4 && NS == 16 && MR == 2);
+    auto mfma1 = [&](const afrag_t& fa, const frag_t& fb, acc_t& c, int m, int n, bool first = false) {
+        opus::vector_t<bf16_t, 8> a1;
+        bvec<8> b1;
+        typename decltype(mma_11)::vtype_c c1{};
+#pragma unroll
+        for(int x = 0; x < 8; x++)
+        {
+            a1[x] = fa[m * 8 + x];
+            b1[x] = fb[n * 8 + x];
+        }
+        if(!first)
+        {
+#pragma unroll
+            for(int p_ = 0; p_ < 4; p_++)
+                c1[p_] = c[(m * NT + n) * 4 + p_];
+        }
+        c1 = mma_11(a1, b1, c1);
+        // The result through an empty asm: the MFMA is no later than here. Without it the compiler
+        // may put a phase's MFMAs after all of its other work, at the pin that ends the phase (ATT).
+        asm volatile("" : "+v"(c1));
+#pragma unroll
+        for(int p_ = 0; p_ < 4; p_++)
+            c[(m * NT + n) * 4 + p_] = c1[p_];
+    };
+    // A compute phase as 8 units: MFMA i (mf), then what goes behind it (f: at most two VALU
+    // instructions and a few scalar ones), fenced so that it stays behind that MFMA.
+    auto units = [&](auto mf, auto f) {
+#pragma unroll
+        for(int i = 0; i < 8; i++)
+        {
+            mf(i);
+            f(i);
+            __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);
+            __builtin_amdgcn_sched_group_barrier(0x002, 2, 0);
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    };
+    // The float4 runs of LSE or D (ld_runs) from an address made a phase before: a lone VALU
+    // instruction in a load phase waits behind the other wave's, and holds it back.
+    auto at_f      = [](unsigned int a) { return opus::make_smem(reinterpret_cast<float*>(static_cast<__UINTPTR_TYPE__>(a))); };
+    const int o_run = 8 * (lane / 16);
+    // addr from this lane's byte offset, the scalar part in an SGPR: one v_add_u32. Left to the
+    // compiler it is a v_lshl_add_u32, which waits for the other wave's scalar run to end (ATT).
+    auto addrb = [&](int b, int off, int ob) {
+        unsigned int sb = gated_mla_bwd::lds_addr(smem + b + off);
+        asm volatile("" : "+s"(sb));
+        unsigned int a = sb + static_cast<unsigned int>(ob);
+        pin(a);
+        return a;
+    };
+#endif
     if(s_wave)
     {
         auto g_kn = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_k_nope) +
@@ -2458,7 +2636,234 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         auto ex_s   = [&](int ks, const frag_t& b) { v_s = mma_k1(a_k[ks], b, ks == 0 ? zero : v_s); };
         auto ex_dv  = [&](int c, const frag_t& b) { v_dv[c] = mma_k1(p_bf, b, v_dv[c]); };
 
+#if GMLA_PAIR_PP
+        // Load and compute phases, as the dQ pass has them (GMLA_DQ_PP). A tile is, per wave, 5 pairs
+        // of a load phase and a compute phase, each closed by a workgroup barrier:
+        //   load     the B fragments of the next 8 MFMAs (two steps) into registers and one more
+        //            thing: a float4 of P to or from LDS, a DMA round
+        //   compute  those 8 MFMAs, with this wave's own VALU work in the 8 of an MFMA's 16 cycles
+        //            that take other vector instructions, at most two behind each
+        // The dP waves run one phase behind the S waves of their SIMDs: a wave reads LDS while the
+        // other one computes. Per tile t of the S waves, phase by phase (S wave | dP wave):
+        //   load  Q(t) steps 0, 1; P(t - 1) chunk 0 out       | dP^T(t - 1) steps 2, 3    dS^T(t - 2) to bf16, 2nd half
+        //   S^T(t) steps 0, 1    exp, P(t - 1) 2nd half        | load Q^T(t - 2) chunks 0, 1; P(t - 1) chunk 0 in
+        //   load  Q(t) steps 2, 3; chunk 1 out                 | dK(t - 2) chunks 0, 1     (dP - D)(t - 1)
+        //   S^T(t) steps 2, 3    P^T(t - 1) to bf16            | load Q^T(t - 2) chunks 2, 3; chunk 1 in
+        //   load  Q(t) steps 4, 5, LSE(t); chunk 2 out         | dK(t - 2) chunks 2, 3     dS(t - 1) chunks 0, 1
+        //   S^T(t) steps 4, 5    LSE log2 e, LDS addresses     | load Q^T(t - 2) chunks 4, 5; chunk 2 in
+        //   load  dO^T(t - 1) chunks 0, 1; chunk 3 out         | dK(t - 2) chunks 4, 5     dS(t - 1) chunk 2
+        //   dV(t - 1) chunks 0, 1    S^T(t) scale - LSE        | load dO(t) steps 0, 1; chunk 3 in
+        //   load  dO^T(t - 1) chunks 2, 3                      | dP^T(t) steps 0, 1        dS(t - 1) chunk 3, dS^T(t - 1) to bf16, 1st half
+        //   dV(t - 1) chunks 2, 3    exp, P(t) 1st half        | load dO(t) steps 2, 3, D(t)
+        // P goes over a float4 a phase: a ds_write_b128 holds its wave for some 60 cycles, which a
+        // load phase of four reads has to spare and one of eight transposed reads, or two writes,
+        // has not (ATT). dV runs a tile behind S^T and dK two, so that P, dS and their bf16 forms
+        // are made behind MFMAs.
+        // DMA is the dP waves' alone (see their part): the S wave's phases are full on both sides
+        // (48 VALU instructions behind its 40 MFMAs; its reads and P's writes), theirs are not.
+        acc_t px;  // P on its way from S^T scale - LSE through exp, beside the next tile's S^T
+#pragma unroll
+        for(int e = 0; e < NS; e++)
+            px[e] = e < NS / 2 ? 0.0f : -1e30f;  // P(i0 - 1) = 0: its halves after and before exp
+        pin(px);
+        frag_t op[2];
+        // A load phase ends without waiting for its reads (see the dQ pass).
+        auto l_end = [&] {
+            asm volatile("" ::: "memory");
+            stage_end();
+        };
+        auto write_px = [&](int c) {
+            *reinterpret_cast<f32x4_t*>(s_p + (c * 64 + lane) * 4) =
+                f32x4_t{px[c * 4], px[c * 4 + 1], px[c * 4 + 2], px[c * 4 + 3]};
+        };
+        // The float4s of P that load phase ph sends (GMLA_X_PWPOS), right behind its reads (early,
+        // GMLA_X_PWMID 1) or at its end.
+        auto wr_px = [&](int ph, bool early) {
+            if(!GMLA_X_PW || early != (GMLA_X_PWMID != 0))
+                return;
+#pragma unroll
+            for(int c = 0; c < NS / 4; c++)
+            {
+                const int at = GMLA_X_PWPOS == 0 ? c + 1
+                               : (GMLA_X_PWPOS == 1 ? (c < 3 ? c + 1 : 3) : (GMLA_X_PWPOS == 2 ? (c < 2 ? c + 1 : c) : (c < 3 ? c + 1 : 5)));
+                if(at == ph)
+                    write_px(c);
+            }
+        };
+        unsigned int a_lse;
+        opus::vector_t<float, 4> lz{0.0f, 0.0f, 0.0f, 0.0f};  // GMLA_X_LSE 0: stands in for LSE
+        pin(lz);
+        int ob_q = o_q * 2, ob_tdo = o_tdo * 2, ob_lse = o_run * 2;
+        pin(ob_q);
+        pin(ob_tdo);
+        pin(ob_lse);
+        // This wave's K in registers (0x0f70 is s_waitcnt vmcnt(0)); the first tiles are in LDS
+        // past the barrier, which the dP waves reach when their loads have landed.
+        __builtin_amdgcn_s_waitcnt(0x0f70);
+        stage_end();
+        int n_full = i_full1 - i_full0;
+        asm volatile("" : "+s"(n_full));
+        if(i0 < T)
+        {
+            a_q   = addrb(b0, OFF_Q, ob_q);
+            a_tdo = addrb(b0, OFF_DO, ob_tdo);
+            a_lse = addrb(b0, OFF_LSE, ob_lse);
+            int bt = b0, bp = b0;  // tile t's buffer, tile t - 1's (tile t's for the first)
+            // The loop closes with one conditional branch: the buffers move on before the test.
+            int t = i0;
+            bool more;
+            do
+            {
+                const int qt0 = t * BQ;
+                // 1: S^T(t) steps 0, 1; behind them the second half of P(t - 1)'s exp. P(t - 1)
+                // chunk 0.
+                op[0] = ld_q(0);
+                op[1] = ld_q(1);
+                __builtin_amdgcn_sched_barrier(0);
+                wr_px(1, true);
+                const int b1 = bnext(bt);
+                wr_px(1, false);
+                l_end();
+                ex_s(0, op[0]);
+                ex_s(1, op[1]);
+#pragma unroll
+                for(int e = NS / 2; e < NS; e++)
+                    px[e] = __builtin_amdgcn_exp2f(px[e]);
+                GMLA_SCHED8(0x400, 1)
+                pin(v_s);
+                pin(px);
+                stage_end();
+                // 2: S^T(t) steps 2, 3; behind each MFMA one pack of P^T(t - 1) to bf16 (C -> A: the
+                // K order of this fragment is what tr_load_b_c_order supplies). P(t - 1) chunk 1.
+                op[0] = ld_q(2);
+                op[1] = ld_q(3);
+                __builtin_amdgcn_sched_barrier(0);
+                wr_px(2, true);
+                wr_px(2, false);
+                l_end();
+                units([&](int i) { mfma1(a_k[2 + i / 4], op[i / 4], v_s, i / 2 % 2, i % 2); },
+                      [&](int i) {
+                          const opus::vector_t<float, 2> f2{px[2 * i], px[2 * i + 1]};
+                          auto h2 = opus::cast<bf16_t>(f2);
+                          pin(h2);  // or the packs sink below the last MFMA
+                          p_bf[2 * i]     = h2[0];
+                          p_bf[2 * i + 1] = h2[1];
+                      });
+                pin(v_s);
+                pin(p_bf);
+                stage_end();
+                // 3: S^T(t) steps 4, 5. LSE(t). Behind the MFMAs, LSE log2 e and the LDS addresses
+                // of dO of tile t - 1 (dV) and of Q and LSE of tile t + 1. P(t - 1) chunk 2.
+                op[0] = ld_q(4);
+                op[1] = ld_q(5);
+                opus::vector_t<float, 4> lse_r[NT];
+#pragma unroll
+                for(int n = 0; n < NT; n++)
+                    lse_r[n] = GMLA_X_LSE ? at_f(a_lse).template load<4>(16 * n) : lz;
+                __builtin_amdgcn_sched_barrier(0);
+                wr_px(3, true);
+                wr_px(3, false);
+                l_end();
+                ex_s(4, op[0]);
+                ex_s(5, op[1]);
+                opus::vector_t<float, 4 * NT> lse2;
+#pragma unroll
+                for(int i = 0; i < 4 * NT; i++)
+                    lse2[i] = lse_r[i / 4][i % 4] * LOG2_E;
+                a_tdo = addrb(bp, OFF_DO, ob_tdo);
+                a_q   = addrb(b1, OFF_Q, ob_q);
+                a_lse = addrb(b1, OFF_LSE, ob_lse);
+                GMLA_SCHED8(0x002, 2)
+                pin(v_s);
+                pin(lse2);
+                stage_end();
+                // 4: dV(t - 1) chunks 0, 1; behind them S^T(t) scale - LSE, into P's registers
+                // (P(t - 1)'s last chunk goes out before).
+                op[0] = ld_tdo(0);
+                op[1] = ld_tdo(1);
+                __builtin_amdgcn_sched_barrier(0);
+                wr_px(4, true);
+                wr_px(4, false);
+                l_end();
+                ex_dv(0, op[0]);
+                ex_dv(1, op[1]);
+#pragma unroll
+                for(int e = 0; e < NS; e++)
+                    px[e] = v_s[e] * scale_log2 - lse2[e / 4 % NT * 4 + e % 4];
+                GMLA_SCHED8(0x002, 2)
+                pin(px);
+                stage_end();
+                // 5: dV(t - 1) chunks 2, 3; behind them the first half of P(t). A tile this pair does
+                // not see in full is masked before its exp (as in the main pass); the test is a
+                // scalar compare whose branch is not taken. The loop test, before the barriers.
+                op[0] = ld_tdo(2);
+                op[1] = ld_tdo(3);
+                __builtin_amdgcn_sched_barrier(0);
+                wr_px(5, true);
+                {
+                    int fd = t - i_full0;
+                    asm volatile("" : "+s"(fd));
+                    if(__builtin_expect(static_cast<unsigned int>(fd) >= static_cast<unsigned int>(n_full), 0))
+                    {
+#pragma unroll
+                        for(int e = 0; e < NS; e++)
+                        {
+                            const int kv = c_kv + 16 * (e / (4 * NT)), qp = qt0 + c_q + 16 * (e / 4 % NT) + e % 4;
+                            const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
+                            px[e]         = ok ? px[e] : -1e30f;
+                        }
+                        pin(px);
+                    }
+                }
+                const int tn = next_tile(t);
+                more         = tn < T;
+                wr_px(5, false);
+                l_end();
+                ex_dv(2, op[0]);
+                ex_dv(3, op[1]);
+#pragma unroll
+                for(int e = 0; e < NS / 2; e++)
+                    px[e] = __builtin_amdgcn_exp2f(px[e]);
+                GMLA_SCHED8(0x400, 1)
+                pin(px);
+                stage_end();
+                t  = tn;
+                bp = bt;
+                bt = b1;
+                if(GMLA_X_LOOPPIN)
+                    asm volatile("" : "+s"(t), "+s"(bp), "+s"(bt));
+            } while(__builtin_expect(more, 1));
+            // Tail: P of the last tile (the second half of its exp; whole to LDS, for the dP wave's
+            // next phase, and to bf16), then its dV.
+#pragma unroll
+            for(int e = NS / 2; e < NS; e++)
+                px[e] = __builtin_amdgcn_exp2f(px[e]);
+#pragma unroll
+            for(int c = 0; c < NS / 4; c++)
+                write_px(c);
+            p_bf  = opus::cast<bf16_t>(px);
+            a_tdo = addrb(bp, OFF_DO, ob_tdo);
+#pragma unroll
+            for(int c = 0; c < NV; c += 2)
+            {
+                op[0] = ld_tdo(c);
+                op[1] = ld_tdo(c + 1);
+                l_end();
+                ex_dv(c, op[0]);
+                ex_dv(c + 1, op[1]);
+                stage_end();
+            }
+            // The dP waves end 12 phases after this wave's loop.
+#pragma unroll
+            for(int x = 0; x < 12 - NV; x++)
+                stage_end();
+        }
+        // The dP waves run one phase behind.
+        stage_end();
+#else
         prologue(std::false_type{});
+        int n_full = i_full1 - i_full0;
+        asm volatile("" : "+s"(n_full));
         if(i0 < T)
         {
             a_q   = addr(b0, OFF_Q, o_q);
@@ -2497,7 +2902,9 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 a_tdo = addr(bt, OFF_DO, o_tdo);
                 a_q   = addr(b1, OFF_Q, o_q);
                 prefetch(ld_q);
+#if !GMLA_X_PFIRST
                 dma_next(t + 3, bprev(bprev(bt)), true, std::false_type{});
+#endif
                 // Each float4 of P goes to LDS as soon as its exps are done, the next exps issuing
                 // while it waits in the LDS queue: four writes back to back wait there in turn.
                 auto write_p = [&](int c) {
@@ -2505,7 +2912,11 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                         f32x4_t{v_s[c * 4], v_s[c * 4 + 1], v_s[c * 4 + 2], v_s[c * 4 + 3]};
                     __builtin_amdgcn_sched_barrier(0);
                 };
-                if(static_cast<unsigned int>(t - i_full0) < static_cast<unsigned int>(i_full1 - i_full0))
+                // A scalar compare and a branch on SCC: the compiler's own form goes through a
+                // lane mask and VCC, which holds back the other wave as a scalar multiply does.
+                int fd = t - i_full0;
+                asm volatile("" : "+s"(fd));
+                if(__builtin_expect(static_cast<unsigned int>(fd) < static_cast<unsigned int>(n_full), 1))
                 {
 #pragma unroll
                     for(int c = 0; c < NS / 4; c++)
@@ -2535,6 +2946,12 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 // C -> A: the K order of this fragment is what tr_load_b_c_order supplies.
                 p_bf = opus::cast<bf16_t>(v_s);
                 pin(p_bf);
+#if GMLA_X_PFIRST
+                // The scalar work last: P's VALU work then runs beside the dP wave's dP^T
+                // steps, which read LDS half as often as its dK steps.
+                __builtin_amdgcn_sched_barrier(0);
+                dma_next(t + 3, bprev(bprev(bt)), true, std::false_type{});
+#endif
                 pin_ring();
                 const int tn    = next_tile(t);
                 const bool more = tn < T;
@@ -2550,6 +2967,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
             stage_end();
             stage_end();
         }
+#endif
 
         auto g_dv = dkv_part(D_NOPE);
 #pragma unroll
@@ -2654,6 +3072,445 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
         for(int c = 0; c < NS / 4; c++)
             *reinterpret_cast<f32x4_t*>(s_p + (c * 64 + lane) * 4) = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
         opus::clear(v_dp);
+#if GMLA_PAIR_PP
+        // The phases are laid out in the S wave's part; this wave runs one behind it. Per tile t it
+        // has dK of tile t - 2, dS of tile t - 1 (as P(t - 1) comes, a float4 a phase) and dP^T of
+        // tile t.
+        acc_t dpd;  // (dP^T - D), then dS^T in fp32
+        opus::clear(dpd);
+        frag_t op[2];
+        auto l_end = [&] {
+            asm volatile("" ::: "memory");
+            stage_end();
+        };
+        // P's float4 c, as the S wave wrote it.
+        auto ld_p = [&](int c) { return *reinterpret_cast<const f32x4_t*>(s_p + (c * 64 + lane) * 4); };
+        f32x4_t pc[NS / 4];
+        // GMLA_X_PR 0: a register stands in for P.
+        f32x4_t pz{0.0f, 0.0f, 0.0f, 0.0f};
+        pin(pz);
+        auto ld_pc = [&](int c) { return GMLA_X_PR ? ld_p(c) : pz; };
+        // D of no tile before the first: with dP^T = 0 and P = 0, dS of the tile before the first is 0.
+        opus::vector_t<float, 4> d_r[NT];
+#pragma unroll
+        for(int n = 0; n < NT; n++)
+#pragma unroll
+            for(int x = 0; x < 4; x++)
+                d_r[n][x] = 0.0f;
+        if(GMLA_X_D == 2)
+        {
+            pin(d_r[0]);
+            pin(d_r[1]);
+        }
+        // One pack of dS^T to bf16, pinned (or the packs sink below the phase's last MFMA).
+        auto pack_ds = [&](int j) {
+            const opus::vector_t<float, 2> f2{dpd[2 * j], dpd[2 * j + 1]};
+            auto h2 = opus::cast<bf16_t>(f2);
+            pin(h2);
+            a_ds[2 * j]     = h2[0];
+            a_ds[2 * j + 1] = h2[1];
+        };
+        unsigned int a_d;
+        int ob_tq = o_tq * 2, ob_do = o_do * 2, ob_d = o_run * 2;
+        pin(ob_tq);
+        pin(ob_do);
+        pin(ob_d);
+
+        // DMA in the phased loop: the dP waves issue every load of a query tile. dP wave wp issues
+        // the tile's 16-byte loads wp + NP u, u = 0 .. 5 (the 22 loads of Q then dO; a load past
+        // them repeats the wave's last one), and as round 6 LSE (even wp) or D. Rounds 0 .. 2 are
+        // loads of Q and 4, 5 of dO for every wave; round 3 is Q's last load for wave 0 and a load
+        // of dO for the others. So four descriptors a wave: Q's, round 3's, dO's and LSE's or D's,
+        // each the tile they point at (its base, and its size: a full tile's, or what x_sizes sets
+        // for the sequence's last, partial tile and the tiles past it). A round is then two
+        // instructions: m0 from the buffer's LDS address and the round's place in it, and the load.
+        constexpr int XR = 7;
+        static_assert(J_Q == 13 && J_D == 9 && NP == 4, "rounds 0 .. 2 load Q, rounds 4, 5 dO");
+        const int wp = w - NP;
+        int x_lds[XR], x_os[XR];
+#pragma unroll
+        for(int u = 0; u < XR - 1; u++)
+        {
+            int jl = wp + NP * u;
+            if(jl >= J_Q + J_D)
+                jl -= NP;
+            const bool isq = jl < J_Q;
+            const int jj   = isq ? jl : jl - J_Q;
+            const int rb   = isq ? k.stride_q_n * 2 : k.stride_do_n * 2;
+            // readfirstlane: the compiler makes these selects in VALU, with the lanes' offsets'.
+            x_lds[u]       = __builtin_amdgcn_readfirstlane((isq ? OFF_Q : OFF_DO) * 2 + jj * 1024);
+            const int spr = isq ? SPR_Q : SPR_D, dch = isq ? D_QK / 8 : D_V / 8;
+            const int sl = 64 * jj + lane, c = sl % spr;
+            x_os[u]      = c < dch ? sl / spr * rb + c * 16 : OOB;
+        }
+        x_lds[XR - 1] = __builtin_amdgcn_readfirstlane((wp % 2 == 0 ? OFF_LSE : OFF_D) * 2);
+        x_os[XR - 1]  = lane * 4;
+        const bool r3q = wp == 0;
+        // Row bytes and a full tile's bytes per descriptor.
+        const int x_rb[4] = {k.stride_q_n * 2, (r3q ? k.stride_q_n : k.stride_do_n) * 2, k.stride_do_n * 2, 4};
+        int x_kb[4];
+        gated_mla_bwd::i32x4_t x_rs[4];
+#pragma unroll
+        for(int d = 0; d < 4; d++)
+        {
+            const char* src = d == 0 ? q_src : (d == 1 ? (r3q ? q_src : do_src) : (d == 2 ? do_src : (wp % 2 == 0 ? l_src : d_src)));
+            x_kb[d]         = BQ * x_rb[d];
+            x_rs[d]         = gated_mla_bwd::dma_rsrc(src + static_cast<long long>(i0) * BQ * x_rb[d], 0);
+            asm volatile("" : "+s"(x_kb[d]));
+        }
+#pragma unroll
+        for(int u = 0; u < XR; u++)
+        {
+            asm volatile("" : "+s"(x_lds[u]));
+            pin(x_os[u]);
+        }
+        // The load phase (0 .. 4: a .. e) each round goes out in. The rounds of dP iteration t go to
+        // tile t + 3, in buffer (t + 3) % NBUF = (t - 2) % NBUF: its dO, LSE and D were last read a
+        // tile ago, its Q is read until this iteration's phase c, so Q's rounds wait for phase d.
+        constexpr int x_ph[XR] = {GMLA_X_RPH};
+        static_assert(x_ph[0] >= 3 && x_ph[1] >= 3 && x_ph[2] >= 3 && x_ph[3] >= 3, "Q's rounds after the buffer's last reads");
+        // The rounds of a tile that are out before phase e's wait.
+        constexpr int x_early = (x_ph[0] < 4) + (x_ph[1] < 4) + (x_ph[2] < 4) + (x_ph[3] < 4) + (x_ph[4] < 4) + (x_ph[5] < 4) + (x_ph[6] < 4);
+        // Tile t's sizes: its rows of the sequence times each descriptor's row bytes.
+        auto x_sizes = [&](int t) {
+            const int rows = dma_rows(t);
+#pragma unroll
+            for(int d = 0; d < 4; d++)
+            {
+                int nb;
+                asm("s_mul_i32 %0, %1, %2" : "=s"(nb) : "s"(rows), "s"(x_rb[d]));
+                x_rs[d] = gated_mla_bwd::i32x4_t{x_rs[d][0], x_rs[d][1], nb, 0x00020000};
+                asm volatile("" : "+s"(x_rs[d]));
+            }
+        };
+        // Descriptor d a tile on.
+        auto x_adv = [&](int d) {
+            auto& r = x_rs[d];
+            asm volatile("" : "+s"(r));  // made here, not where r was last set
+            unsigned long long a =
+                static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
+            a += static_cast<unsigned long long>(static_cast<unsigned int>(x_kb[d]));
+            r = gated_mla_bwd::i32x4_t{static_cast<int>(a), static_cast<int>(a >> 32), r[2], 0x00020000};
+            asm volatile("" : "+s"(r));
+        };
+        // Round u into the buffer at LDS address lb.
+        auto x_go = [&](int u, unsigned int lb) {
+            const int d = u < 3 ? 0 : (u == 3 ? 1 : (u < XR - 1 ? 2 : 3));
+            if(u == XR - 1)
+                asm volatile("s_add_u32 m0, %2, %3\n\tbuffer_load_dword %0, %1, 0 offen lds"
+                             :
+                             : "v"(x_os[u]), "s"(x_rs[d]), "s"(lb), "s"(x_lds[u])
+                             : "m0", "scc");
+            else
+                asm volatile("s_add_u32 m0, %2, %3\n\tbuffer_load_dwordx4 %0, %1, 0 offen lds"
+                             :
+                             : "v"(x_os[u]), "s"(x_rs[d]), "s"(lb), "s"(x_lds[u])
+                             : "m0", "scc");
+        };
+        // The rounds of load phase ph.
+        auto x_rounds = [&](int ph, unsigned int lb) {
+#pragma unroll
+            for(int u = 0; u < XR; u++)
+                if(GMLA_X_DMA && (GMLA_X_RMASK >> u & 1) && x_ph[u] == ph)
+                    x_go(u, lb);
+        };
+        (void)prologue;
+        (void)bprev;
+        // The first three tiles in LDS and this wave's V in registers before the loop (0x0f70 is
+        // s_waitcnt vmcnt(0)); the S waves, which load nothing, wait at this barrier.
+        {
+            int b = b0;
+#pragma unroll
+            for(int x = 0; x < 3; x++, b = bnext(b))
+            {
+                if(x > 0)
+                {
+#pragma unroll
+                    for(int d = 0; d < 4; d++)
+                        x_adv(d);
+                }
+                x_sizes(i0 + x);
+                const unsigned int lbx = dma_lds(b);
+                if(i0 < T)
+                {
+#pragma unroll
+                    for(int u = 0; u < XR; u++)
+                        x_go(u, lbx);
+                }
+            }
+            __builtin_amdgcn_s_waitcnt(0x0f70);
+            dma_wait();
+            stage_end();
+        }
+        // The dP waves run one phase behind.
+        stage_end();
+        if(i0 < T)
+        {
+            a_tq = addrb(b0, OFF_Q, ob_tq);
+            int bt = b0, bp = b0;  // tile t's buffer, tile t - 1's (tile t's for the first)
+            // The buffer this iteration's rounds go to (tile t + 3's) and its LDS address.
+            int bd = bnext(bnext(bnext(b0)));
+            unsigned int lb = dma_lds(bd);
+            asm volatile("" : "+s"(lb));
+#pragma unroll
+            for(int d = 0; d < 4; d++)
+                x_adv(d);
+            x_sizes(i0 + 3);
+            // A scalar made behind an MFMA: its input goes through an empty asm in that unit. The
+            // compiler makes a scalar where its inputs are ready, which for these is the top of the
+            // phase: 20 of them in a row there held the MFMAs back 80 cycles (ATT).
+            auto here = [](auto& x) { asm volatile("" : "+s"(x)); };
+            // The LDS addresses of this tile's dO and D (for its phases d and e) and of Q of the
+            // tile before (for the next tile's phases a to c), one behind an MFMA: unit i of
+            // compute phase ph.
+            auto addrs = [&](int ph, int i) {
+                const int k = GMLA_X_DSV ? (i == 7 ? ph : -1) : (ph == 2 ? i - 4 : -1);
+                if(k == 0)
+                {
+                    here(bt);
+                    a_do = addrb(bt, OFF_DO, ob_do);
+                }
+                if(k == 1)
+                {
+                    here(bt);
+                    a_d = addrb(bt, OFF_D, ob_d);
+                }
+                if(k == 2)
+                {
+                    here(bp);
+                    a_tq = addrb(bp, OFF_Q, ob_tq);
+                }
+            };
+            // The loop closes with one conditional branch: the buffers move on before the test.
+            int t = i0;
+            bool more;
+            do
+            {
+                // a: dK(t - 2) chunks 0, 1 (dS^T(t - 2) = 0 for the first two tiles, whose steps
+                // read the first tile's Q and add nothing); behind them (dP^T - D)(t - 1). P(t - 1)
+                // chunk 0, which the S wave wrote a phase ago.
+                if(!GMLA_X_PRLAST)
+                    pc[0] = ld_pc(0);
+                op[0] = ld_tq(0);
+                op[1] = ld_tq(1);
+                if(GMLA_X_PRLAST)
+                    pc[0] = ld_pc(0);
+                __builtin_amdgcn_sched_barrier(0);
+                store_ds(0);
+                x_rounds(0, lb);
+                l_end();
+                if(GMLA_X_DSV)
+                {
+                    units([&](int i) { mfma1(a_ds, op[i / 4], v_dk[i / 4], i / 2 % 2, i % 2); },
+                          [&](int i) {
+                              if(GMLA_X_DSV == 1)
+                                  dpd[i] = v_dp[i] - d_r[i / 4 % NT][i % 4];
+                              addrs(0, i);
+                          });
+                }
+                else
+                {
+                    ex_dk(0, op[0]);
+                    ex_dk(1, op[1]);
+#pragma unroll
+                    for(int e = 0; e < NS; e++)
+                        dpd[e] = v_dp[e] - d_r[e / 4 % NT][e % 4];
+                    GMLA_SCHED8(0x002, 2)
+                }
+                pin(dpd);
+                stage_end();
+                // b: dK(t - 2) chunks 2, 3; behind them dS(t - 1) chunks 0, 1 = P (dP^T - D).
+                // P(t - 1) chunk 1.
+                if(!GMLA_X_PRLAST)
+                    pc[1] = ld_pc(1);
+                op[0] = ld_tq(2);
+                op[1] = ld_tq(3);
+                if(GMLA_X_PRLAST)
+                    pc[1] = ld_pc(1);
+                __builtin_amdgcn_sched_barrier(0);
+                store_ds(1);
+                x_rounds(1, lb);
+                l_end();
+                units([&](int i) { mfma1(a_ds, op[i / 4], v_dk[2 + i / 4], i / 2 % 2, i % 2); },
+                      [&](int i) {
+                          if(GMLA_X_DSV == 1)
+                              dpd[8 + i] = v_dp[8 + i] - d_r[i / 4 % NT][i % 4];
+                          else if(GMLA_X_DSV == 2)
+                          {
+#pragma unroll
+                              for(int e = 2 * i; e < 2 * i + 2; e++)
+                                  dpd[e] = v_dp[e] - d_r[e / 4 % NT][e % 4];
+                          }
+                          else
+                              dpd[i] = pc[i / 4][i % 4] * dpd[i];
+                          addrs(1, i);
+                      });
+                pin(dpd);
+                stage_end();
+                // c: dK(t - 2) chunks 4, 5; behind them dS(t - 1) chunk 2 and the LDS addresses of
+                // the operands to come. P(t - 1) chunk 2.
+                if(!GMLA_X_PRLAST)
+                    pc[2] = ld_pc(2);
+                op[0] = ld_tq(4);
+                op[1] = ld_tq(5);
+                if(GMLA_X_PRLAST)
+                    pc[2] = ld_pc(2);
+                __builtin_amdgcn_sched_barrier(0);
+                x_rounds(2, lb);
+                l_end();
+                units([&](int i) { mfma1(a_ds, op[i / 4], v_dk[4 + i / 4], i / 2 % 2, i % 2); },
+                      [&](int i) {
+                          if(GMLA_X_DSV)
+                              dpd[i] = pc[i / 4][i % 4] * dpd[i];
+                          else if(i < 4)
+                              dpd[8 + i] = pc[2][i] * dpd[8 + i];
+                          addrs(2, i);
+                      });
+                pin(dpd);
+                stage_end();
+                // d: dP^T(t) steps 0, 1; behind them dS(t - 1) chunk 3 and the first half of
+                // dS^T(t - 1) to bf16 (dK(t - 2) is done). P(t - 1) chunk 3.
+                if(!GMLA_X_PRLAST)
+                    pc[3] = ld_pc(3);
+                op[0] = ld_do(0);
+                op[1] = ld_do(1);
+                if(GMLA_X_PRLAST)
+                    pc[3] = ld_pc(3);
+                __builtin_amdgcn_sched_barrier(0);
+                x_rounds(3, lb);
+                l_end();
+                units([&](int i) { mfma1(a_v(i / 4), op[i / 4], v_dp, i / 2 % 2, i % 2, i < 4); },
+                      [&](int i) {
+                          if(i < 4)
+                          {
+                              const int e = (GMLA_X_DSV ? 8 : 12) + i;
+                              dpd[e]      = pc[e / 4][i] * dpd[e];
+                          }
+                          else
+                              pack_ds(i - 4);
+                      });
+                pin(v_dp);
+                pin(dpd);
+                pin(a_ds);
+                stage_end();
+                // e: dP^T(t) steps 2, 3; behind them the second half of dS^T(t - 1) to bf16, the
+                // buffer of the next tile's rounds and the descriptors a tile on. D(t).
+                // This wave's loads of tile t + 2, issued a tile ago, are waited for here, by
+                // count: x_early loads of tile t + 3 are out (loads return in order; the stores of
+                // dS(t - 2), counted too, only make the wait longer if they are still out). Then
+                // this phase's rounds, and the sizes of the next tile's if it is not a full one.
+                // The descriptor of dS(t - 1)'s tile; the loop test, before the barriers.
+                op[0] = ld_do(2);
+                op[1] = ld_do(3);
+                if(GMLA_X_D == 1)
+                {
+#pragma unroll
+                    for(int n = 0; n < NT; n++)
+                        d_r[n] = at_f(a_d).template load<4>(16 * n);
+                }
+                __builtin_amdgcn_sched_barrier(0);
+                asm volatile("s_waitcnt vmcnt(%0)" : : "n"(GMLA_X_DMA ? x_early : 0) : "memory");
+                x_rounds(4, lb);
+                if(GMLA_X_DMA)
+                {
+                    int rl = seqlen_q - (t + 4) * BQ;
+                    asm volatile("" : "+s"(rl));
+                    if(__builtin_expect(rl < BQ, 0))
+                        x_sizes(t + 4);
+                }
+                ds_tile(t - 1);
+                const int bn = bnext(bt);
+                const int tn = next_tile(t);
+                more         = tn < T;
+                l_end();
+                units([&](int i) { mfma1(a_v(2 + i / 4), op[i / 4], v_dp, i / 2 % 2, i % 2); },
+                      [&](int i) {
+                          if(GMLA_X_DSV)
+                          {
+                              if(i < 4)
+                                  dpd[12 + i] = pc[3][i] * dpd[12 + i];
+                              if(i < 2)
+                                  pack_ds(4 + i);
+                              if(i == 4 || i == 5)
+                                  pack_ds(2 + i);
+                          }
+                          else if(i < 4)
+                              pack_ds(4 + i);
+                          if(GMLA_X_DMA && i == (GMLA_X_DSV ? 2 : 0))
+                              bd = bnext(bd);
+                          if(GMLA_X_DMA && i == (GMLA_X_DSV ? 3 : 1))
+                          {
+                              here(bd);
+                              lb = dma_lds(bd);
+                              asm volatile("" : "+s"(lb));
+                          }
+                          if(GMLA_X_DMA && i >= 4)
+                              x_adv(i - 4);
+                      });
+                pin(v_dp);
+                pin(dpd);
+                pin(a_ds);
+                stage_end();
+                t  = tn;
+                bp = bt;
+                bt = bn;
+                if(GMLA_X_LOOPPIN)
+                    asm volatile("" : "+s"(t), "+s"(bp), "+s"(bt));
+            } while(__builtin_expect(more, 1));
+            // Tail. The S wave wrote P of the last tile whole a phase ago. dK(T - 2), with dS(T - 1)
+            // behind its first steps and to bf16 after its last; then dK(T - 1).
+            op[0] = ld_tq(0);
+            op[1] = ld_tq(1);
+#pragma unroll
+            for(int c = 0; c < NS / 4; c++)
+                pc[c] = ld_p(c);
+            __builtin_amdgcn_sched_barrier(0);
+            store_ds(0);
+            l_end();
+            ex_dk(0, op[0]);
+            ex_dk(1, op[1]);
+#pragma unroll
+            for(int e = 0; e < NS; e++)
+                dpd[e] = pc[e / 4][e % 4] * (v_dp[e] - d_r[e / 4 % NT][e % 4]);
+            pin(dpd);
+            stage_end();
+            op[0] = ld_tq(2);
+            op[1] = ld_tq(3);
+            __builtin_amdgcn_sched_barrier(0);
+            store_ds(1);
+            l_end();
+            ex_dk(2, op[0]);
+            ex_dk(3, op[1]);
+            stage_end();
+            op[0] = ld_tq(4);
+            op[1] = ld_tq(5);
+            l_end();
+            ex_dk(4, op[0]);
+            ex_dk(5, op[1]);
+#pragma unroll
+            for(int c = 0; c < NK; c++)
+                pin(v_dk[c]);
+            a_ds = opus::cast<bf16_t>(dpd);
+            pin(a_ds);
+            ds_tile(T - 1);
+            a_tq = addrb(bp, OFF_Q, ob_tq);
+            stage_end();
+#pragma unroll
+            for(int c = 0; c < NK; c += 2)
+            {
+                op[0] = ld_tq(c);
+                op[1] = ld_tq(c + 1);
+                if(c == 0)
+                    store_ds(0);
+                if(c == 2)
+                    store_ds(1);
+                l_end();
+                ex_dk(c, op[0]);
+                ex_dk(c + 1, op[1]);
+                stage_end();
+            }
+        }
+#else
         prologue(std::true_type{});
         if(i0 < T)
         {
@@ -2704,7 +3561,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
                 bt = bn;
             }
             // A': dS of the last tile and the first steps of B'. B': dK of it.
-            const int bl = (T - 1) % NBUF;
+            const int bl = (T - 1) % NBUF * SZ_BUF;
             ds(bl, [&] {
                 a_tq = addr(bl, OFF_Q, o_tq);
                 prefetch(ld_tq);
@@ -2720,6 +3577,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair::BLOCK, 1) void gated_mla_bwd_dk
             });
             stage_end();
         }
+#endif
 
         // dK nope into the kv_b_proj layout, dK rope per head in fp32.
 #pragma unroll
@@ -2852,7 +3710,7 @@ __global__ __launch_bounds__(gated_mla_bwd_pair32::BLOCK, 1) void gated_mla_bwd_
     }
     auto dma_rows = [&](int t) {
         int r = seqlen_q - t * BQ;
-        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(BQ));
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(r) : "n"(BQ) : "scc");
         return r;
     };
     auto bnext     = [](int b) { return b + 1 == NBUF ? 0 : b + 1; };
