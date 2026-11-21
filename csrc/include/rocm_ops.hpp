@@ -1649,6 +1649,11 @@ namespace py = pybind11;
           py::arg("d_o"),                             \
           py::arg("dgate"),                           \
           py::arg("d"));                              \
+    m.def("gated_mla_bwd_dot_bf16_opus",              \
+          &gated_mla_bwd_dot_bf16_opus,               \
+          py::arg("dout"),                            \
+          py::arg("out"),                             \
+          py::arg("d"));                              \
     m.def("gated_mla_bwd_bf16_opus",                  \
           &gated_mla_bwd_bf16_opus,                   \
           py::arg("q"),                               \
@@ -1696,6 +1701,36 @@ namespace py = pybind11;
           py::arg("seqstart_q"),                      \
           py::arg("seqstart_k"),                      \
           py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"));                  \
+    m.def("gated_mla_bwd_dkdv_pair_ds_bf16_opus",     \
+          &gated_mla_bwd_dkdv_pair_ds_bf16_opus,      \
+          py::arg("q"),                               \
+          py::arg("k_nope"),                          \
+          py::arg("v"),                               \
+          py::arg("k_rot"),                           \
+          py::arg("d_o"),                             \
+          py::arg("lse"),                             \
+          py::arg("d"),                               \
+          py::arg("dkv"),                             \
+          py::arg("dk_rope"),                         \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"),                   \
+          py::arg("ds"),                              \
+          py::arg("ds_seq"));                         \
+    m.def("gated_mla_bwd_dq_ds_bf16_opus",            \
+          &gated_mla_bwd_dq_ds_bf16_opus,             \
+          py::arg("k_nope"),                          \
+          py::arg("k_rot"),                           \
+          py::arg("ds"),                              \
+          py::arg("ds_seq"),                          \
+          py::arg("dq"),                              \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_q"),                    \
           py::arg("causal"),                          \
           py::arg("softmax_scale"));                  \
     m.def("gated_mla_bwd_dq_bf16_opus",               \

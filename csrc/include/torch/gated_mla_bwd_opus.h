@@ -19,6 +19,10 @@ void gated_mla_bwd_pre_bf16_opus(at::Tensor& dout,
                                  at::Tensor& dgate,
                                  at::Tensor& d);
 
+// The pre-pass of an attention without the gate: d = rowsum(dout * out) alone, dout then being
+// the attention output gradient as it is.
+void gated_mla_bwd_dot_bf16_opus(at::Tensor& dout, at::Tensor& out, at::Tensor& d);
+
 // Main pass, group / varlen, H_KV == H. K is read like the forward reads it: dims 0..127
 // from k_nope, dims 128..191 from k_rot, shared by every head.
 //   q      [total_q, H, 192]   k_nope, v [total_k, H, 128] (may be views of one kv_b_proj
@@ -76,6 +80,39 @@ void gated_mla_bwd_dkdv_pair_bf16_opus(at::Tensor& q,
                                        int max_seqlen_k,
                                        bool causal,
                                        float softmax_scale);
+
+// As gated_mla_bwd_dkdv_pair_bf16_opus, also writing dS to ds (bf16, laid out as
+// gated_mla_bwd_ds in gated_mla_bwd_opus_defs.h) for gated_mla_bwd_dq_ds_bf16_opus; ds_seq
+// [num_seqs] int64 is each sequence's first tile in ds.
+void gated_mla_bwd_dkdv_pair_ds_bf16_opus(at::Tensor& q,
+                                          at::Tensor& k_nope,
+                                          at::Tensor& v,
+                                          at::Tensor& k_rot,
+                                          at::Tensor& d_o,
+                                          at::Tensor& lse,
+                                          at::Tensor& d,
+                                          at::Tensor& dkv,
+                                          at::Tensor& dk_rope,
+                                          at::Tensor& seqstart_q,
+                                          at::Tensor& seqstart_k,
+                                          int max_seqlen_k,
+                                          bool causal,
+                                          float softmax_scale,
+                                          at::Tensor& ds,
+                                          at::Tensor& ds_seq);
+
+// dQ = dS K softmax_scale from the dS gated_mla_bwd_dkdv_pair_ds_bf16_opus wrote: output dq
+// [total_q, H, 192] bf16 (written, not accumulated). max_seqlen_q sizes the grid.
+void gated_mla_bwd_dq_ds_bf16_opus(at::Tensor& k_nope,
+                                   at::Tensor& k_rot,
+                                   at::Tensor& ds,
+                                   at::Tensor& ds_seq,
+                                   at::Tensor& dq,
+                                   at::Tensor& seqstart_q,
+                                   at::Tensor& seqstart_k,
+                                   int max_seqlen_q,
+                                   bool causal,
+                                   float softmax_scale);
 
 // dQ pass, no atomics: inputs as the main pass, output dq [total_q, H, 192] bf16 (written,
 // not accumulated), including softmax_scale. max_seqlen_q sizes the grid.

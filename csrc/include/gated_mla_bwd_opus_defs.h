@@ -52,6 +52,7 @@ struct gated_mla_bwd_kargs {
     int H;
     int num_seqs;
     int n_kv_blocks;  // per sequence, from max_seqlen_k
+    int hg;           // heads per scheduling group (gated_mla_bwd::wg_heads)
     int stride_q_n, stride_q_h;
     int stride_k_n, stride_k_h;
     int stride_v_n, stride_v_h;
@@ -63,6 +64,9 @@ struct gated_mla_bwd_kargs {
     int stride_dkr_n, stride_dkr_h;
     float softmax_scale;
     int causal;
+    // Pair pass only: dS tiles out (gated_mla_bwd_ds), or none if null; each sequence's first tile.
+    void* __restrict__ ptr_ds;
+    const long long* __restrict__ ptr_ds_seq;
 };
 
 namespace gated_mla_bwd {
@@ -73,9 +77,62 @@ constexpr int BQ = 16;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int DQ_M = D_QK / NW;  // dQ: each wave owns 48 dims of the tile
 constexpr int BLOCK = NW * 64;
-// Heads per scheduling group, a multiple of the 8 XCDs that workgroups reach round-robin by
-// linear id; see the kernel's id map.
-constexpr int HG = 16;
+// Workgroup id -> (head, sequence, block in dispatch order), for every pass. Ids run: groups of
+// `hg` heads one after another (only about hg heads' tensors are live in the caches at a time);
+// within a group its sequences in order; within a sequence its blocks in order (the long causal
+// ones first); the head fastest. The last group holds the heads that are left and has no idle ids.
+//
+// The GPU deals workgroups by id to 32 lanes (id % 32: its 8 XCDs by id % 8, 4 lanes of 8 CUs in
+// each), a round of 32 ids at a time and in step: a lane gets its next workgroup only once every
+// lane has taken the round before, so in a round whose workgroups differ in length the lanes with
+// the shorter ones idle by the difference. With hg = 16 each XCD keeps to 2 heads of a group, whose
+// consecutive blocks run together and read the same tiles close in time, from L2 (which a batch's
+// other sequences in between, or more heads, undo); a round then holds two consecutive blocks,
+// and half the lanes idle one block's step per workgroup, little against long workgroups. With
+// hg = 32 a round is 32 heads' same block and no lane idles, at 4 heads on an XCD. Measured on an
+// MI350X, 96 heads, causal: hg = 32 is 4 to 5% faster on batches of 512 and 1024 tokens, the same
+// from 2K to 8K, 2.5% slower at 16K; hg = 64 is no better anywhere; in non-causal attention the
+// workgroups of a sequence are all as long, and no lane idles.
+constexpr int HG       = 16;    // heads per scheduling group
+constexpr int HG_SHORT = 32;    // for causal sequences of at most HG_SHORT_MAX tokens
+#ifndef GMLA_HGS
+#define GMLA_HGS 2048
+#endif
+constexpr int HG_SHORT_MAX = GMLA_HGS;
+struct wg_ids {
+    int h, g, blk;
+};
+__host__ __device__ inline int wg_heads(int max_seqlen, int causal)
+{
+    return causal && max_seqlen <= HG_SHORT_MAX ? HG_SHORT : HG;
+}
+__host__ __device__ inline long long wg_count(int H, int num_seqs, int n_blocks)
+{
+    return static_cast<long long>(H) * num_seqs * n_blocks;
+}
+// `hg`: wg_heads' power of two.
+__host__ __device__ inline wg_ids wg_map(int wg, int H, int num_seqs, int n_blocks, int hg)
+{
+    const int per  = num_seqs * n_blocks;  // workgroups of a head
+    const int full = H & -hg;              // heads in whole groups
+    int h0 = wg / (hg * per) * hg, n = hg, local = wg % (hg * per);
+    if(wg >= full * per)
+    {
+        h0    = full;
+        n     = H - full;
+        local = wg - full * per;
+    }
+    const int sb = local / n;
+    int blk      = sb % n_blocks;
+#ifndef GMLA_ZIG
+#define GMLA_ZIG 1
+#endif
+#if GMLA_ZIG
+    if((blk & 2) && (blk | 1) < n_blocks)
+        blk ^= 1;
+#endif
+    return {h0 + local % n, sb / n_blocks, blk};
+}
 
 // LDS, bf16 elements, all row-major with 8 elements of row padding. Per-tile operands are
 // stored once and read transposed with ds_read_b64_tr_b16 where needed; the key block, staged
@@ -102,7 +159,6 @@ constexpr int WR = BK / NW;
 constexpr int BQ = 32;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
-constexpr int HG = 16;
 // LDS, bf16, double-buffered by query-tile parity: sQ [BQ][D_QK] (B of S^T; B of dK,
 // transposed) and sDO [BQ][D_V] (B of dP^T; B of dV, transposed), rows padded by 16 elements
 // (conflict-free, see gated_mla_bwd_pair). The epilogue then transposes each wave's
@@ -124,7 +180,6 @@ constexpr int PR = BK / NP;
 constexpr int BQ = 32;   // queries per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
-constexpr int HG = 16;
 // LDS, in bf16 elements: NBUF query tiles, each sQ [BQ][D_QK] (B of S^T; B of dK, transposed),
 // sDO [BQ][D_V] (B of dP^T; B of dV, transposed) and the tile's LSE and D in fp32 (256 bytes
 // each, one DMA load). Rows padded by 16 elements: with 8, both the B-fragment ds_read_b128 and
@@ -137,6 +192,28 @@ constexpr int SZ_BUF     = OFF_D + 128;
 constexpr int OFF_P      = NBUF * SZ_BUF;
 constexpr int SMEM_ELEMS = OFF_P + NP * PR * BQ * 2;
 } // namespace gated_mla_bwd_pair
+
+// The pair pass on 32x32x16 MFMAs (gated_mla_bwd_dkdv_pair32_kernel): as gated_mla_bwd_pair, query
+// tiles laid out for that MFMA's fragments as in gated_mla_bwd_dq32 (rows of Q 224 and of dO 160
+// elements apart, 16-byte chunk c of row r stored at c ^ swz(r)).
+namespace gated_mla_bwd_pair32 {
+using gated_mla_bwd_pair::BK;
+using gated_mla_bwd_pair::NW;
+using gated_mla_bwd_pair::NP;
+using gated_mla_bwd_pair::PR;
+using gated_mla_bwd_pair::BQ;
+using gated_mla_bwd_pair::D_QK;
+using gated_mla_bwd_pair::D_V;
+using gated_mla_bwd_pair::D_NOPE;
+using gated_mla_bwd_pair::D_ROT;
+using gated_mla_bwd_pair::BLOCK;
+constexpr int NBUF = 5;
+constexpr int LD_Q = D_QK + 32, LD_DO = D_V + 32;
+constexpr int OFF_Q = 0, OFF_DO = OFF_Q + BQ * LD_Q, OFF_LSE = OFF_DO + BQ * LD_DO, OFF_D = OFF_LSE + 128;
+constexpr int SZ_BUF     = OFF_D + 128;
+constexpr int OFF_P      = NBUF * SZ_BUF;
+constexpr int SMEM_ELEMS = OFF_P + NP * PR * BQ * 2;
+} // namespace gated_mla_bwd_pair32
 
 // dQ pass without atomics, one workgroup per (query block of 256, sequence, head). Each wave
 // keeps its 32 queries' Q, dO and dQ in registers and walks the keys in tiles of 32,
@@ -156,6 +233,7 @@ struct gated_mla_bwd_dq_kargs {
     int H;
     int num_seqs;
     int n_q_blocks;  // per sequence, from max_seqlen_q
+    int hg;          // heads per scheduling group (gated_mla_bwd::wg_heads)
     int stride_q_n, stride_q_h;
     int stride_k_n, stride_k_h;
     int stride_v_n, stride_v_h;
@@ -165,7 +243,49 @@ struct gated_mla_bwd_dq_kargs {
     int stride_dq_n, stride_dq_h;
     float softmax_scale;
     int causal;
+    // dQ from dS only (gated_mla_bwd_dq_ds_kernel): the pair pass's dS tiles, each sequence's first.
+    const void* __restrict__ ptr_ds;
+    const long long* __restrict__ ptr_ds_seq;
 };
+
+// dS as the pair pass keeps it for the dQ pass: per sequence, then per head of the launch, then per
+// key tile j of 32 keys, the 32 x 32 tiles of query tiles first_q_tile(j) .. T - 1 in order (the
+// ones causal masking leaves). A tile is 32 key rows of 64 bytes; row r holds key r's dS against the
+// tile's queries, query 16 a + 4 b + c at element 8 b + 4 a + c (how the pair pass's registers hold
+// them). Bottom-right causal: query qp sees keys kv <= qp + (seqlen_k - seqlen_q).
+namespace gated_mla_bwd_ds {
+constexpr int TILE = 32 * 32;  // bf16 elements per tile
+__host__ __device__ constexpr int floor_div32(int a) { return a >= 0 ? a / 32 : -((31 - a) / 32); }
+// Key tile j's first query tile, of T.
+__host__ __device__ inline int first_q_tile(int j, int T, int co, int causal)
+{
+    if(!causal)
+        return 0;
+    const int i = j + floor_div32(-co);
+    return i < 0 ? 0 : (i > T ? T : i);
+}
+// sum over u = 0 .. n - 1 of clamp(u, 0, T).
+__host__ __device__ inline long long clamp_sum(long long n, long long T)
+{
+    if(n <= 0)
+        return 0;
+    if(n <= T + 1)
+        return n * (n - 1) / 2;
+    return T * (T + 1) / 2 + (n - T - 1) * T;
+}
+// Key tile j's first tile within its (sequence, head) block: sum over j' < j of T - first_q_tile(j').
+__host__ __device__ inline long long col_offset(int j, int T, int co, int causal)
+{
+    if(!causal)
+        return static_cast<long long>(j) * T;
+    const long long s = floor_div32(-co);
+    return static_cast<long long>(j) * T - (clamp_sum(j + s, T) - clamp_sum(s, T));
+}
+__host__ __device__ inline long long tiles_per_head(int seqlen_q, int seqlen_k, int causal)
+{
+    return col_offset((seqlen_k + 31) / 32, (seqlen_q + 31) / 32, seqlen_k - seqlen_q, causal);
+}
+} // namespace gated_mla_bwd_ds
 
 namespace gated_mla_bwd_dq {
 constexpr int NW = 8;          // waves
@@ -174,7 +294,6 @@ constexpr int BQ = NW * WQ;    // queries per workgroup
 constexpr int KC = 32;         // keys per tile
 constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
 constexpr int BLOCK = NW * 64;
-constexpr int HG = 16;         // heads per scheduling group, as in the main pass
 // LDS, bf16: NBUF key tiles, each sKN [KC][D_NOPE] and sKR [KC][D_ROT] (K; B of S, and of dQ
 // transposed) and sV [KC][D_V] (B of dP). K's two parts come from two tensors, so each part is
 // one DMA region. Rows padded by 16 elements (conflict-free, see gated_mla_bwd_pair).
@@ -187,3 +306,49 @@ constexpr int SZ_BUF     = OFF_V + KC * LD_V;
 constexpr int OFF_QR     = NBUF * SZ_BUF;
 constexpr int SMEM_ELEMS = OFF_QR + BQ * LD_QR;
 } // namespace gated_mla_bwd_dq
+
+// dQ = dS K from the pair pass's dS (gated_mla_bwd_dq_ds_kernel): the dQ pass's query blocks and
+// waves; per key tile, K as in gated_mla_bwd_dq (B of dQ, transposed reads) and each wave's dS
+// tile, its 16-byte chunks swizzled within a row (chunk c of row r at c ^ (r / 4 % 4)) so that the
+// transposed reads that make dS the A operand are conflict-free.
+namespace gated_mla_bwd_dqds {
+using gated_mla_bwd_dq::NW;
+using gated_mla_bwd_dq::WQ;
+using gated_mla_bwd_dq::BQ;
+using gated_mla_bwd_dq::KC;
+using gated_mla_bwd_dq::D_QK;
+using gated_mla_bwd_dq::D_NOPE;
+using gated_mla_bwd_dq::D_ROT;
+using gated_mla_bwd_dq::BLOCK;
+using gated_mla_bwd_dq::LD_KN;
+using gated_mla_bwd_dq::LD_KR;
+constexpr int NBUF   = 5;
+constexpr int OFF_KN = 0, OFF_KR = OFF_KN + KC * LD_KN, OFF_DS = OFF_KR + KC * LD_KR;
+constexpr int SZ_BUF     = OFF_DS + NW * gated_mla_bwd_ds::TILE;
+constexpr int SMEM_ELEMS = NBUF * SZ_BUF;
+} // namespace gated_mla_bwd_dqds
+
+// The dQ pass on 32x32x16 MFMAs (gated_mla_bwd_dq32_kernel): tiles and stages as
+// gated_mla_bwd_dq, LDS laid out for that MFMA's fragments, conflict-free. Its A fragment reads
+// (lane: row l % 32, one 16-byte chunk) and its transposed K reads (a 16-lane group: 4 rows x
+// 32 bytes, two groups the same rows) conflict on every padding that whole 1 KB DMA loads allow,
+// so key tile rows are 160 / 96 elements apart (the transposed reads' rows 64 bytes apart in
+// the banks) and the 16-byte chunks of row r are swizzled: chunk c is stored at c ^ swz(r),
+// swz(r) = bit 2 of r | bit 4 of r << 1. sQR, read by A-fragment reads only, needs neither.
+namespace gated_mla_bwd_dq32 {
+using gated_mla_bwd_dq::NW;
+using gated_mla_bwd_dq::WQ;
+using gated_mla_bwd_dq::BQ;
+using gated_mla_bwd_dq::KC;
+using gated_mla_bwd_dq::D_QK;
+using gated_mla_bwd_dq::D_V;
+using gated_mla_bwd_dq::D_NOPE;
+using gated_mla_bwd_dq::D_ROT;
+using gated_mla_bwd_dq::BLOCK;
+constexpr int NBUF = 4;
+constexpr int LD_KN = D_NOPE + 32, LD_KR = D_ROT + 32, LD_V = D_V + 32, LD_QR = D_ROT + 8;
+constexpr int OFF_KN = 0, OFF_KR = OFF_KN + KC * LD_KN, OFF_V = OFF_KR + KC * LD_KR;
+constexpr int SZ_BUF     = OFF_V + KC * LD_V;
+constexpr int OFF_QR     = NBUF * SZ_BUF;
+constexpr int SMEM_ELEMS = OFF_QR + BQ * LD_QR;
+} // namespace gated_mla_bwd_dq32

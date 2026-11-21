@@ -21,23 +21,23 @@ void check_rows(const at::Tensor& t, const at::Tensor& like, const char* name)
                 name, " rows must be contiguous and 16-byte aligned");
 }
 
-} // namespace
-
-void gated_mla_bwd_pre_bf16_opus(at::Tensor& dout,
-                                 at::Tensor& out,
-                                 at::Tensor& gate,
-                                 at::Tensor& d_o,
-                                 at::Tensor& dgate,
-                                 at::Tensor& d)
+// Pre-pass; without `gate`, `d_o` and `dgate` (all three null) it makes D alone.
+void launch_pre(at::Tensor& dout,
+                at::Tensor& out,
+                at::Tensor* gate,
+                at::Tensor* d_o,
+                at::Tensor* dgate,
+                at::Tensor& d)
 {
     TORCH_CHECK(dout.is_cuda(), "dout must be a GPU tensor");
     TORCH_CHECK(dout.dim() == 3 && dout.size(2) == 128, "dout must be [total, H, 128]");
     for(auto [t, name] : {std::pair<at::Tensor*, const char*>{&dout, "dout"},
                           {&out, "out"},
-                          {&gate, "gate"},
-                          {&d_o, "d_o"},
-                          {&dgate, "dgate"}})
-        check_rows(*t, dout, name);
+                          {gate, "gate"},
+                          {d_o, "d_o"},
+                          {dgate, "dgate"}})
+        if(t != nullptr)
+            check_rows(*t, dout, name);
     const int total = static_cast<int>(dout.size(0));
     const int H     = static_cast<int>(dout.size(1));
     TORCH_CHECK(d.device() == dout.device() && d.scalar_type() == at::kFloat && d.dim() == 2 &&
@@ -47,17 +47,20 @@ void gated_mla_bwd_pre_bf16_opus(at::Tensor& dout,
     gated_mla_bwd_pre_kargs k{};
     k.ptr_dout  = dout.data_ptr();
     k.ptr_out   = out.data_ptr();
-    k.ptr_gate  = gate.data_ptr();
-    k.ptr_do    = d_o.data_ptr();
-    k.ptr_dgate = dgate.data_ptr();
     k.ptr_d     = d.data_ptr<float>();
     k.total     = total;
     k.H         = H;
     k.stride_dout_n  = static_cast<int>(dout.stride(0));  k.stride_dout_h  = static_cast<int>(dout.stride(1));
     k.stride_out_n   = static_cast<int>(out.stride(0));   k.stride_out_h   = static_cast<int>(out.stride(1));
-    k.stride_gate_n  = static_cast<int>(gate.stride(0));  k.stride_gate_h  = static_cast<int>(gate.stride(1));
-    k.stride_do_n    = static_cast<int>(d_o.stride(0));   k.stride_do_h    = static_cast<int>(d_o.stride(1));
-    k.stride_dgate_n = static_cast<int>(dgate.stride(0)); k.stride_dgate_h = static_cast<int>(dgate.stride(1));
+    if(gate != nullptr)
+    {
+        k.ptr_gate  = gate->data_ptr();
+        k.ptr_do    = d_o->data_ptr();
+        k.ptr_dgate = dgate->data_ptr();
+        k.stride_gate_n  = static_cast<int>(gate->stride(0));  k.stride_gate_h  = static_cast<int>(gate->stride(1));
+        k.stride_do_n    = static_cast<int>(d_o->stride(0));   k.stride_do_h    = static_cast<int>(d_o->stride(1));
+        k.stride_dgate_n = static_cast<int>(dgate->stride(0)); k.stride_dgate_h = static_cast<int>(dgate->stride(1));
+    }
     k.stride_d_h     = static_cast<int>(d.stride(0));
     if(total == 0 || H == 0)
         return;
@@ -70,6 +73,23 @@ void gated_mla_bwd_pre_bf16_opus(at::Tensor& dout,
                                0,
                                at::hip::getCurrentHIPStream()>>>(k);
     HIP_CALL_LAUNCH(hipGetLastError());
+}
+
+} // namespace
+
+void gated_mla_bwd_pre_bf16_opus(at::Tensor& dout,
+                                 at::Tensor& out,
+                                 at::Tensor& gate,
+                                 at::Tensor& d_o,
+                                 at::Tensor& dgate,
+                                 at::Tensor& d)
+{
+    launch_pre(dout, out, &gate, &d_o, &dgate, d);
+}
+
+void gated_mla_bwd_dot_bf16_opus(at::Tensor& dout, at::Tensor& out, at::Tensor& d)
+{
+    launch_pre(dout, out, nullptr, nullptr, nullptr, d);
 }
 
 namespace {
@@ -90,7 +110,9 @@ void launch_main(at::Tensor& q,
                  int max_seqlen_k,
                  bool causal,
                  float softmax_scale,
-                 bool pair = false)
+                 bool pair            = false,
+                 at::Tensor* ds       = nullptr,
+                 at::Tensor* ds_seq   = nullptr)
 {
     using namespace gated_mla_bwd;
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
@@ -157,20 +179,40 @@ void launch_main(at::Tensor& q,
     a.stride_dkr_n   = static_cast<int>(dk_rope.stride(0)); a.stride_dkr_h = static_cast<int>(dk_rope.stride(1));
     a.softmax_scale  = softmax_scale;
     a.causal         = causal ? 1 : 0;
+    if(ds)
+    {
+        TORCH_CHECK(pair && ds->device() == q.device() && ds->scalar_type() == at::kBFloat16 && ds->is_contiguous(),
+                    "ds must be contiguous bf16 on q's device (pair pass only)");
+        TORCH_CHECK(ds_seq->device() == q.device() && ds_seq->scalar_type() == at::kLong && ds_seq->is_contiguous() &&
+                        ds_seq->numel() == seqstart_q.numel() - 1,
+                    "ds_seq must be contiguous int64 [num_seqs] on q's device");
+        a.ptr_ds     = ds->data_ptr();
+        a.ptr_ds_seq = reinterpret_cast<const long long*>(ds_seq->data_ptr<int64_t>());
+    }
     if(total_q == 0 || total_k == 0 || H == 0)
         return;
     const int bk  = pair ? gated_mla_bwd_pair::BK : (dq_acc ? BK : gated_mla_bwd_4w::BK);
     a.num_seqs    = B;
     a.n_kv_blocks = (max_seqlen_k + bk - 1) / bk;
-    const long long n_wg = static_cast<long long>(HG) * a.n_kv_blocks * B * ((H + HG - 1) / HG);
+    a.hg          = gated_mla_bwd::wg_heads(max_seqlen_k, a.causal);
+    const long long n_wg = gated_mla_bwd::wg_count(H, B, a.n_kv_blocks);
     TORCH_CHECK(n_wg <= 0x7fffffffLL, "too many workgroups");
 
     HipDeviceGuard guard(q.device().index());
     if(pair)
-        gated_mla_bwd_dkdv_pair_kernel<<<dim3(static_cast<unsigned>(n_wg)),
-                                         dim3(gated_mla_bwd_pair::BLOCK),
-                                         0,
-                                         at::hip::getCurrentHIPStream()>>>(a);
+#ifdef GMLA_PAIR_MFMA32
+        gated_mla_bwd_dkdv_pair32_kernel<<<dim3(static_cast<unsigned>(n_wg)), dim3(gated_mla_bwd_pair::BLOCK), 0,
+                                           at::hip::getCurrentHIPStream()>>>(a);
+#else
+    {
+        if(ds)
+            gated_mla_bwd_dkdv_pair_kernel<true><<<dim3(static_cast<unsigned>(n_wg)), dim3(gated_mla_bwd_pair::BLOCK), 0,
+                                                   at::hip::getCurrentHIPStream()>>>(a);
+        else
+            gated_mla_bwd_dkdv_pair_kernel<false><<<dim3(static_cast<unsigned>(n_wg)), dim3(gated_mla_bwd_pair::BLOCK), 0,
+                                                    at::hip::getCurrentHIPStream()>>>(a);
+    }
+#endif
     else if(dq_acc)
         gated_mla_bwd_kernel<true>
             <<<dim3(static_cast<unsigned>(n_wg)), dim3(BLOCK), 0, at::hip::getCurrentHIPStream()>>>(a);
@@ -240,6 +282,96 @@ void gated_mla_bwd_dkdv_pair_bf16_opus(at::Tensor& q,
 {
     launch_main(q, k_nope, v, k_rot, d_o, lse, d, nullptr, dkv, dk_rope, seqstart_q, seqstart_k,
                 max_seqlen_k, causal, softmax_scale, true);
+}
+
+void gated_mla_bwd_dkdv_pair_ds_bf16_opus(at::Tensor& q,
+                                          at::Tensor& k_nope,
+                                          at::Tensor& v,
+                                          at::Tensor& k_rot,
+                                          at::Tensor& d_o,
+                                          at::Tensor& lse,
+                                          at::Tensor& d,
+                                          at::Tensor& dkv,
+                                          at::Tensor& dk_rope,
+                                          at::Tensor& seqstart_q,
+                                          at::Tensor& seqstart_k,
+                                          int max_seqlen_k,
+                                          bool causal,
+                                          float softmax_scale,
+                                          at::Tensor& ds,
+                                          at::Tensor& ds_seq)
+{
+    launch_main(q, k_nope, v, k_rot, d_o, lse, d, nullptr, dkv, dk_rope, seqstart_q, seqstart_k,
+                max_seqlen_k, causal, softmax_scale, true, &ds, &ds_seq);
+}
+
+void gated_mla_bwd_dq_ds_bf16_opus(at::Tensor& k_nope,
+                                   at::Tensor& k_rot,
+                                   at::Tensor& ds,
+                                   at::Tensor& ds_seq,
+                                   at::Tensor& dq,
+                                   at::Tensor& seqstart_q,
+                                   at::Tensor& seqstart_k,
+                                   int max_seqlen_q,
+                                   bool causal,
+                                   float softmax_scale)
+{
+    using namespace gated_mla_bwd_dqds;
+    TORCH_CHECK(dq.is_cuda(), "dq must be a GPU tensor");
+    const int total_q = static_cast<int>(dq.size(0));
+    const int H       = static_cast<int>(dq.size(1));
+    const int total_k = static_cast<int>(k_nope.size(0));
+    auto check = [&](const at::Tensor& t, at::ScalarType dt, std::initializer_list<int64_t> shape,
+                     int vec, const char* name) {
+        TORCH_CHECK(t.device() == dq.device(), name, " must be on dq's device");
+        TORCH_CHECK(t.scalar_type() == dt, name, " has the wrong dtype");
+        TORCH_CHECK(t.sizes() == at::IntArrayRef(shape), name, " has the wrong shape");
+        TORCH_CHECK(t.stride(-1) == 1, name, " must be contiguous along its last dim");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % (vec * t.element_size()) == 0,
+                    name, " is not aligned for its vector accesses");
+        for(int i = 0; i + 1 < t.dim(); i++)
+            TORCH_CHECK(t.stride(i) % vec == 0, name, " strides must be multiples of ", vec);
+    };
+    check(k_nope, at::kBFloat16, {total_k, H, D_NOPE}, 8, "k_nope");
+    check(k_rot, at::kBFloat16, {total_k, D_ROT}, 8, "k_rot");
+    check(dq, at::kBFloat16, {total_q, H, D_QK}, 4, "dq");
+    TORCH_CHECK(ds.device() == dq.device() && ds.scalar_type() == at::kBFloat16 && ds.is_contiguous(),
+                "ds must be contiguous bf16 on dq's device");
+    const int B = static_cast<int>(seqstart_q.numel()) - 1;
+    TORCH_CHECK(B > 0 && seqstart_k.numel() == B + 1, "seqstart_q / seqstart_k must be [num_seqs + 1]");
+    for(const at::Tensor* s : {&seqstart_q, &seqstart_k})
+        TORCH_CHECK(s->device() == dq.device() && s->scalar_type() == at::kInt && s->is_contiguous(),
+                    "seqstart_q / seqstart_k must be contiguous int32 on dq's device");
+    TORCH_CHECK(ds_seq.device() == dq.device() && ds_seq.scalar_type() == at::kLong && ds_seq.is_contiguous() &&
+                    ds_seq.numel() == B,
+                "ds_seq must be contiguous int64 [num_seqs] on dq's device");
+    TORCH_CHECK(max_seqlen_q > 0, "max_seqlen_q must be > 0");
+
+    gated_mla_bwd_dq_kargs a{};
+    a.ptr_k_nope     = k_nope.data_ptr();
+    a.ptr_k_rot      = k_rot.data_ptr();
+    a.ptr_dq         = dq.data_ptr();
+    a.ptr_ds         = ds.data_ptr();
+    a.ptr_ds_seq     = reinterpret_cast<const long long*>(ds_seq.data_ptr<int64_t>());
+    a.ptr_seqstart_q = seqstart_q.data_ptr<int>();
+    a.ptr_seqstart_k = seqstart_k.data_ptr<int>();
+    a.H              = H;
+    a.stride_k_n     = static_cast<int>(k_nope.stride(0));  a.stride_k_h  = static_cast<int>(k_nope.stride(1));
+    a.stride_k_rot_n = static_cast<int>(k_rot.stride(0));
+    a.stride_dq_n    = static_cast<int>(dq.stride(0));      a.stride_dq_h = static_cast<int>(dq.stride(1));
+    a.softmax_scale  = softmax_scale;
+    a.causal         = causal ? 1 : 0;
+    if(total_q == 0 || H == 0)
+        return;
+    a.num_seqs   = B;
+    a.n_q_blocks = (max_seqlen_q + BQ - 1) / BQ;
+    a.hg         = gated_mla_bwd::wg_heads(max_seqlen_q, a.causal);
+    const long long n_wg = gated_mla_bwd::wg_count(H, B, a.n_q_blocks);
+    TORCH_CHECK(n_wg <= 0x7fffffffLL, "too many workgroups");
+
+    HipDeviceGuard guard(dq.device().index());
+    gated_mla_bwd_dq_ds_kernel<<<dim3(static_cast<unsigned>(n_wg)), dim3(BLOCK), 0, at::hip::getCurrentHIPStream()>>>(a);
+    HIP_CALL_LAUNCH(hipGetLastError());
 }
 
 void gated_mla_bwd_dq_bf16_opus(at::Tensor& q,
@@ -313,11 +445,16 @@ void gated_mla_bwd_dq_bf16_opus(at::Tensor& q,
         return;
     a.num_seqs   = B;
     a.n_q_blocks = (max_seqlen_q + BQ - 1) / BQ;
-    const long long n_wg = static_cast<long long>(HG) * a.n_q_blocks * B * ((H + HG - 1) / HG);
+    a.hg         = gated_mla_bwd::wg_heads(max_seqlen_q, a.causal);
+    const long long n_wg = gated_mla_bwd::wg_count(H, B, a.n_q_blocks);
     TORCH_CHECK(n_wg <= 0x7fffffffLL, "too many workgroups");
 
     HipDeviceGuard guard(q.device().index());
+#ifdef GMLA_DQ_MFMA32
+    gated_mla_bwd_dq32_kernel<<<dim3(static_cast<unsigned>(n_wg)),
+#else
     gated_mla_bwd_dq_kernel<<<dim3(static_cast<unsigned>(n_wg)),
+#endif
                               dim3(BLOCK),
                               0,
                               at::hip::getCurrentHIPStream()>>>(a);
