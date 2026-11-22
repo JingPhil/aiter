@@ -85,26 +85,20 @@ constexpr int BLOCK = NW * 64;
 // The GPU deals workgroups by id to 32 lanes (id % 32: its 8 XCDs by id % 8, 4 lanes of 8 CUs in
 // each), a round of 32 ids at a time and in step: a lane gets its next workgroup only once every
 // lane has taken the round before, so in a round whose workgroups differ in length the lanes with
-// the shorter ones idle by the difference. With hg = 16 each XCD keeps to 2 heads of a group, whose
-// consecutive blocks run together and read the same tiles close in time, from L2 (which a batch's
-// other sequences in between, or more heads, undo); a round then holds two consecutive blocks,
-// and half the lanes idle one block's step per workgroup, little against long workgroups. With
-// hg = 32 a round is 32 heads' same block and no lane idles, at 4 heads on an XCD. Measured on an
-// MI350X, 96 heads, causal: hg = 32 is 4 to 5% faster on batches of 512 and 1024 tokens, the same
-// from 2K to 8K, 2.5% slower at 16K; hg = 64 is no better anywhere; in non-causal attention the
-// workgroups of a sequence are all as long, and no lane idles.
-constexpr int HG       = 16;    // heads per scheduling group
-constexpr int HG_SHORT = 32;    // for causal sequences of at most HG_SHORT_MAX tokens
-#ifndef GMLA_HGS
-#define GMLA_HGS 2048
-#endif
-constexpr int HG_SHORT_MAX = GMLA_HGS;
+// the shorter ones idle by the difference. The group size goes by the mask:
+//   causal  32 heads: a sequence's blocks differ in length, and a round is then 32 heads' same
+//           block, so no lane idles (4 heads on an XCD).
+//   none    16 heads: the blocks are all as long, a round holds two consecutive blocks and no lane
+//           idles either; each XCD keeps to 2 heads of a group, whose consecutive blocks run
+//           together and read the same tiles close in time, from L2.
+constexpr int HG        = 16;  // heads per scheduling group
+constexpr int HG_CAUSAL = 32;  // with a causal mask
 struct wg_ids {
     int h, g, blk;
 };
-__host__ __device__ inline int wg_heads(int max_seqlen, int causal)
+__host__ __device__ inline int wg_heads(int causal)
 {
-    return causal && max_seqlen <= HG_SHORT_MAX ? HG_SHORT : HG;
+    return causal ? HG_CAUSAL : HG;
 }
 __host__ __device__ inline long long wg_count(int H, int num_seqs, int n_blocks)
 {
@@ -149,9 +143,80 @@ constexpr int OFF_KT  = OFF_DST + 2 * BK * LD_T;
 constexpr int SMEM_ELEMS = OFF_KT + D_QK * LD_KT;
 } // namespace gated_mla_bwd
 
-// dK / dV pass, 4 waves: each wave (one per SIMD) owns 48 keys with their K, V, dK and dV
-// (accumulators in AGPRs), on 32-query tiles so that every GEMM is a full-rate 16x16x32 MFMA.
-// Takes gated_mla_bwd_kargs (n_kv_blocks counted in BK = 192); ptr_dq_acc is unused.
+// The 4-wave backward (gated_mla_bwd_4w_kernel): the dK / dV pass and the dQ pass in one launch.
+// 192 bytes, which the kernel reads in scalar loads of 16 dwords. A pass with no blocks is left out.
+//
+// The launch's grid is the workgroup's place, so the kernel divides nothing: x is the head within
+// its group of hg heads (x fastest: a round of the GPU's 32 dispatch lanes is 32 heads' same
+// block with hg = 32, two consecutive blocks of 16 heads with hg = 16, see gated_mla_bwd::wg_map),
+// and a pass's blocks go in order, the long ones first. One launch lets the CUs that the last
+// dK / dV workgroups leave idle take dQ workgroups. The order of the passes goes by the mask:
+//   causal   z = group * num_seqs + sequence, y the block (the dK / dV pass's, then the dQ
+//            pass's): a group's two passes on a sequence run back to back, the second on tensors
+//            the first left in the caches.
+//   none     z = sequence * 2 + pass (z = sequence with one pass), y = group * nb + block (nb the
+//            larger of the passes' block counts): a sequence's dK / dV pass group by group, then
+//            its dQ pass. Without a mask a pass's workgroups are all as long and the CUs run in
+//            step, so that the consecutive blocks of a head an XCD has in flight read a tile at
+//            the same time, all but one of them from L2; a change of pass inside the launch leaves
+//            the CUs out of step, so there is one per sequence. (Causal workgroups differ in
+//            length and are never in step.)
+// Ids past H heads (the last group) or past a pass's blocks end at once.
+struct gated_mla_bwd_4w_kargs {
+    const void* __restrict__ ptr_q;
+    const void* __restrict__ ptr_k_nope;
+    const void* __restrict__ ptr_v;
+    const void* __restrict__ ptr_k_rot;
+    const void* __restrict__ ptr_do;
+    const float* __restrict__ ptr_lse;
+    const float* __restrict__ ptr_d;
+    const int* __restrict__ ptr_seqstart_q;
+    const int* __restrict__ ptr_seqstart_k;
+    void* __restrict__ ptr_dq;
+    void* __restrict__ ptr_dkv;
+    float* __restrict__ ptr_dk_rope;
+    int H;
+    int num_seqs;
+    int n_kv_blocks;  // dK / dV pass: key blocks per sequence, from max_seqlen_k
+    int n_q_blocks;   // dQ pass: query blocks per sequence, from max_seqlen_q
+    int hg;           // heads per scheduling group (gated_mla_bwd::wg_heads)
+    int causal;
+    float softmax_scale;
+    int stride_k_rot_n;
+    int stride_q_n, stride_q_h;
+    int stride_k_n, stride_k_h;
+    int stride_v_n, stride_v_h;
+    int stride_do_n, stride_do_h;
+    int stride_lse_h;  // LSE and D share [H, total_q]
+    int stride_dq_n, stride_dq_h;
+    int stride_dkv_n, stride_dkv_h;
+    int stride_dkr_n, stride_dkr_h;
+    int div_magic;  // ceil(2^31 / d), d = num_seqs (causal) or nb: c * div_magic >> 31 is c / d
+};
+static_assert(sizeof(gated_mla_bwd_4w_kargs) == 192, "three loads of 16 dwords");
+
+// The grid of that launch (0 in x: nothing to launch) and div_magic, from the other fields; false
+// if the kernel's division would not be exact (the coordinate times the divisor must stay below
+// 2^31).
+__host__ inline bool gated_mla_bwd_4w_grid(gated_mla_bwd_4w_kargs& a, unsigned int grid[3])
+{
+    const long long groups = (a.H + a.hg - 1) / a.hg;
+    const long long nb     = a.n_kv_blocks > a.n_q_blocks ? a.n_kv_blocks : a.n_q_blocks;
+    const int passes       = (a.n_kv_blocks > 0) + (a.n_q_blocks > 0);
+    const int by_group     = a.causal ? 1 : 0;  // the order of the passes, see gated_mla_bwd_4w_kargs
+    const long long d      = by_group ? a.num_seqs : nb;
+    grid[0] = static_cast<unsigned int>(a.H < a.hg ? a.H : a.hg);
+    grid[1] = static_cast<unsigned int>(by_group ? a.n_kv_blocks + a.n_q_blocks : groups * nb);
+    grid[2] = static_cast<unsigned int>(by_group ? groups * a.num_seqs : static_cast<long long>(a.num_seqs) * passes);
+    if(passes == 0 || a.num_seqs <= 0)
+        grid[0] = 0;
+    a.div_magic = d > 0 ? static_cast<int>(((1LL << 31) + d - 1) / d) : 0;
+    return groups * d * d < (1LL << 31) && static_cast<long long>(a.num_seqs) * passes < (1LL << 31);
+}
+
+// The dK / dV pass of the 4-wave backward (gated_mla_bwd_4w_kernel): each wave (one per SIMD) owns
+// 48 keys with their K, V, dK and dV (accumulators in AGPRs), on 32-query tiles so that every GEMM
+// is a full-rate 16x16x32 MFMA. n_kv_blocks counts blocks of BK = 192 keys.
 namespace gated_mla_bwd_4w {
 constexpr int BK = 192;  // keys per workgroup
 constexpr int NW = 4;    // waves; wave w owns keys [48 w, 48 w + 48)
@@ -306,6 +371,23 @@ constexpr int SZ_BUF     = OFF_V + KC * LD_V;
 constexpr int OFF_QR     = NBUF * SZ_BUF;
 constexpr int SMEM_ELEMS = OFF_QR + BQ * LD_QR;
 } // namespace gated_mla_bwd_dq
+
+// The dQ pass of the 4-wave backward (gated_mla_bwd_4w_kernel), one wave per SIMD: wave w owns queries
+// [48 w, 48 w + 48) of the workgroup's 192, its Q and dO in VGPRs and its dQ in AGPRs. Key tiles as
+// gated_mla_bwd_dq's (sKN, sKR, sV, rows padded by 16 elements), in NBUF buffers.
+namespace gated_mla_bwd_dq4 {
+constexpr int NW = 4;
+constexpr int WQ = 48;
+constexpr int BQ = NW * WQ;
+constexpr int KC = 32;
+constexpr int D_QK = 192, D_V = 128, D_NOPE = 128, D_ROT = 64;
+constexpr int BLOCK = NW * 64;
+constexpr int NBUF = 4;
+constexpr int LD_KN = D_NOPE + 16, LD_KR = D_ROT + 16, LD_V = D_V + 16;
+constexpr int OFF_KN = 0, OFF_KR = OFF_KN + KC * LD_KN, OFF_V = OFF_KR + KC * LD_KR;
+constexpr int SZ_BUF     = OFF_V + KC * LD_V;
+constexpr int SMEM_ELEMS = NBUF * SZ_BUF;
+} // namespace gated_mla_bwd_dq4
 
 // dQ = dS K from the pair pass's dS (gated_mla_bwd_dq_ds_kernel): the dQ pass's query blocks and
 // waves; per key tile, K as in gated_mla_bwd_dq (B of dQ, transposed reads) and each wave's dS

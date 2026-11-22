@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Benchmark matrix of the gated MLA attention backward (OPUS, `_gated_mla_bwd`) against the
-ASM v3 backward, Kimi-K3 MLA head dims (Q / K 192, V 128), bf16, gfx950.
+"""Benchmark matrix of the MLA attention backward (OPUS, `_gated_mla_bwd` without its gate)
+against the ASM v3 backward, Kimi-K3 MLA head dims (Q / K 192, V 128), bf16, gfx950.
 
 Every row times, on one set of inputs:
 
@@ -9,14 +9,16 @@ Every row times, on one set of inputs:
   a16    ASM v3 backward with bf16 dQ atomics (batch mode), the baseline of the ratios;
          for varlen mixes (group mode) the ASM v3 backward has no D_QK 192 / D_V 128
          kernel and `flash_attn_varlen_func` runs CK, which is then the baseline ("ck")
-  sep    OPUS backward, dQ mode "separate" (the default): pre-pass, dK / dV pair pass and a
-         dQ pass that recomputes S and dP
+  sep    OPUS backward, dQ mode "separate" (the default): the D pass, then one launch of
+         the dK / dV pass and a dQ pass that recomputes S and dP
   ds     OPUS backward, dQ mode "ds": the pair pass also writes dS, a GEMM pass makes dQ
 
-gate = 100 makes sigmoid(gate) exactly 1 in bf16, so the gated op is plain attention and all
-of them solve the same problem on the same q, k, v and dO; ASM gets K materialized as
-[k_nope | k_rot]. OPUS's time still includes its gate pre-pass (dO, dgate, D), which ASM
-has no counterpart of; its share of the kernel time is reported (pre%).
+The conditions are ASM's: no gate. OPUS runs the backward of the attention alone (gate None:
+dO is dout as it is, and its pre-pass makes only D = rowsum(dO * O), which ASM makes in a
+kernel of its own too), so all of them solve the same problem on the same q, k, v and dO;
+ASM gets K materialized as [k_nope | k_rot]. The D pass's share of OPUS's kernel time is
+reported (pre%). The forward that provides `out` and `lse` runs with gate = 100, whose
+sigmoid is exactly 1 in bf16: its output is the attention's.
 
 GQA / MQA rows (fewer KV heads than query heads): the OPUS kernels read a KV row per query
 head, so the shared KV is expanded to the query heads (a stride-0 view when one KV head
@@ -357,7 +359,7 @@ def run_case(group, seqlens, hq, hk, causal, opt):
                 q,
                 kv_per_query_head(),
                 k_rot,
-                gate,
+                None,  # no gate, as ASM: `out` is the attention's output
                 out,
                 lse,
                 dout,
@@ -522,8 +524,8 @@ def run_case(group, seqlens, hq, hk, causal, opt):
             part = "other"
             if "gated_mla_bwd_pre" in key:
                 part = "pre"
-            elif "gated_mla_bwd_dkdv" in key:
-                part = "pair"
+            elif "gated_mla_bwd_dkdv" in key or "gated_mla_bwd_4w" in key:
+                part = "pair"  # "separate": the one launch of the dK / dV and dQ passes
             elif "gated_mla_bwd_dq" in key:
                 part = "dq"
             parts[part] += value

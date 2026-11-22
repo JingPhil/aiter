@@ -1687,6 +1687,24 @@ namespace py = pybind11;
           py::arg("max_seqlen_k"),                    \
           py::arg("causal"),                          \
           py::arg("softmax_scale"));                  \
+    m.def("gated_mla_bwd_dkdvdq_bf16_opus",           \
+          &gated_mla_bwd_dkdvdq_bf16_opus,            \
+          py::arg("q"),                               \
+          py::arg("k_nope"),                          \
+          py::arg("v"),                               \
+          py::arg("k_rot"),                           \
+          py::arg("d_o"),                             \
+          py::arg("lse"),                             \
+          py::arg("d"),                               \
+          py::arg("dq"),                              \
+          py::arg("dkv"),                             \
+          py::arg("dk_rope"),                         \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_q"),                    \
+          py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"));                  \
     m.def("gated_mla_bwd_dkdv_pair_bf16_opus",        \
           &gated_mla_bwd_dkdv_pair_bf16_opus,         \
           py::arg("q"),                               \

@@ -2,10 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Backward matrix of the gated MLA attention kernels (`_gated_mla_bwd`, Kimi-K3 gated MLA).
 
-Every case runs the backward (gate pre-pass, dK / dV pair pass, dQ) on the fused forward's
-bf16 output and LSE in both dQ modes, "separate" and "ds", which must agree bit for bit, and
-compares dq, d(kv) as [dk_nope | dv], dk_rot and dgate with fp32 autograd (`_ref_bwd` of
-test_gated_mla_train): the relative L2 error must stay within PARITY_REL_L2.
+Every case runs the backward (gate pre-pass, dK / dV pass, dQ) on the fused forward's
+bf16 output and LSE in each dQ mode, "separate" and "ds", and compares dq, d(kv) as
+[dk_nope | dv], dk_rot and dgate with fp32 autograd (`_ref_bwd` of test_gated_mla_train): the
+relative L2 error must stay within PARITY_REL_L2. That is the requirement on either mode; the
+two need not agree bit for bit ("separate" starts dP's accumulators at -D by default, "ds"
+subtracts D, which differ in the order of fp32 sums).
 
 The cases cover sequence lengths from one token, around the kernels' tile and block edges,
 to 65536 tokens and batches of 131072 at the K3 head count, equal-length batches and varlen
@@ -32,6 +34,8 @@ except ImportError:  # run from op_tests itself
 pytestmark = pytest.mark.skipif(not T._is_gfx950(), reason="gfx950 only")
 
 _OUTPUTS = ("dq", "dkv", "dk_rot", "dgate")
+# The dQ mode `_fwd_bwd` runs, set by the `dq_mode` fixture.
+_DQ_MODE = "separate"
 # Largest relative L2 error of each output over the module's cases, with its case.
 _worst = {}
 
@@ -42,6 +46,16 @@ def _module_globals():
     saved = gmt._BWD_DQ_MODE, gmt._BWD_DS_BUDGET, T.HEADS
     yield
     gmt._BWD_DQ_MODE, gmt._BWD_DS_BUDGET, T.HEADS = saved
+
+
+@pytest.fixture(params=["separate", "ds"])
+def dq_mode(request):
+    """Runs a test once per dQ mode: `_fwd_bwd` computes the gradients in it, and the test holds
+    them to fp32 autograd."""
+    global _DQ_MODE
+    _DQ_MODE = request.param
+    yield request.param
+    _DQ_MODE = "separate"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -84,13 +98,9 @@ def _assert_equal(a, b, what):
 
 
 def _fwd_bwd(q, kv, k_rot, gate, dout, cu, smax, causal):
-    """Fused forward, then the backward in both dQ modes: "separate"'s gradients, which
-    "ds" must reproduce bit for bit."""
+    """Fused forward, then the backward in the test's dQ mode (the `dq_mode` fixture)."""
     out, lse = gmt._gated_mla_fwd(q, kv, k_rot, gate, cu, smax, T.SCALE, causal, True)
-    args = (q, kv, k_rot, gate, out, lse, dout, cu, smax, causal)
-    sep, ds = _bwd("separate", *args), _bwd("ds", *args)
-    _assert_equal(ds, sep, '"ds" against "separate"')
-    return sep
+    return _bwd(_DQ_MODE, q, kv, k_rot, gate, out, lse, dout, cu, smax, causal)
 
 
 def _assert_parity(ours, ref, names=_OUTPUTS, scales=None):
@@ -118,14 +128,42 @@ def _check(seqlens, heads, causal):
     _assert_parity(ours, T._ref_bwd(q, kv, k_rot, gate, dout, cu, causal))
 
 
-# Around the 32-row tiles of every pass, the pair pass's 128-key blocks and the dQ pass's
-# 256-query blocks.
-_EDGE_LENS = [31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 513]
+# Around the 32-row tiles of every pass; the 48 rows of a wave and the 192-row blocks of the 4-wave
+# dK / dV and dQ passes ("separate"); the pair pass's 128-key blocks and the dS GEMM's 256-query
+# blocks ("ds").
+_EDGE_LENS = [
+    31,
+    32,
+    33,
+    47,
+    48,
+    49,
+    63,
+    64,
+    65,
+    95,
+    96,
+    97,
+    127,
+    128,
+    129,
+    191,
+    192,
+    193,
+    255,
+    256,
+    257,
+    383,
+    385,
+    511,
+    513,
+]
 
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("heads", [1, 9, 33])
 @pytest.mark.parametrize("seqlen", _EDGE_LENS)
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_edge_lengths(seqlen, heads, causal):
     """One short sequence, its length at or next to a tile or block edge."""
     _check([seqlen], heads, causal)
@@ -154,6 +192,7 @@ def _dp_term_norms(q, kv, k_rot, gate, dout, cu, causal):
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("batch", [1, 4, 16])
 @pytest.mark.parametrize("seqlen", [1, 2])
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_one_and_two_tokens(seqlen, batch, causal):
     """Sequences of one or two tokens. A query that sees one key has P = 1 and
     dS = P (dP - D) = 0, and two keys leave dS = +-P0 P1 (dP0 - dP1): dq, dk_nope and dk_rot
@@ -193,6 +232,7 @@ _MEDIUM = [
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("seqlens,heads", _MEDIUM, ids=_case_ids(_MEDIUM))
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_medium_lengths(seqlens, heads, causal):
     _check(seqlens, heads, causal)
 
@@ -212,6 +252,7 @@ _LARGE = [
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("seqlens,heads", _LARGE, ids=_case_ids(_LARGE))
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_large(seqlens, heads, causal):
     _check(seqlens, heads, causal)
 
@@ -271,6 +312,7 @@ _FULL_SIZE = [
     _FULL_SIZE,
     ids=_case_ids([case[:2] for case in _FULL_SIZE]),
 )
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_full_size(seqlens, heads, ref_heads, causal):
     """Production-size problems against fp32 autograd taken one head at a time, on all
     heads or, for the largest, on `_SOME_HEADS`."""
@@ -308,6 +350,7 @@ _BATCHES = [
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("seqlens,heads", _BATCHES, ids=_case_ids(_BATCHES))
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_batches(seqlens, heads, causal):
     _check(seqlens, heads, causal)
 
@@ -323,6 +366,7 @@ _SEQLENS = [600, 1, 257, 1000]
     "seqlens", [_SEQLENS, [1024] * 2], ids=["b4_min1_max1000", "b2_s1024"]
 )
 @pytest.mark.parametrize("heads", _HEAD_COUNTS)
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_head_counts(heads, seqlens, causal):
     _check(seqlens, heads, causal)
 
@@ -352,7 +396,7 @@ _DS_LAUNCHES = [
 def test_gated_mla_bwd_ds_launches(heads, fit, launches, causal, monkeypatch):
     """The "ds" mode under a dS budget of `fit` heads' tiles: launches of 16, 8 or 4 heads
     (a multiple of 16 where more fit) with the heads that are left in the last one, or dQ
-    recomputed where fewer than 4 fit. Every layout must reproduce "separate" bit for bit.
+    recomputed where fewer than 4 fit. Every layout is held to fp32 autograd, as "separate" is.
     """
     cu, smax, q, kv, k_rot, gate, dout = _inputs(_SEQLENS, heads)
     per_head = sum(gmt._ds_tiles_per_head(n, n, causal) for n in _SEQLENS)
@@ -369,10 +413,10 @@ def test_gated_mla_bwd_ds_launches(heads, fit, launches, causal, monkeypatch):
         monkeypatch.setattr(gmt, name, counted)
         return heads_of
 
-    # The two "ds" passes and the dQ pass that recomputes.
+    # The two "ds" passes and the launch that recomputes dQ ("separate": dK / dV and dQ in one).
     pair_ds = launch_heads("_gated_mla_bwd_dkdv_pair_ds_bf16_opus")
     dq_ds = launch_heads("_gated_mla_bwd_dq_ds_bf16_opus")
-    dq_recomputed = launch_heads("_gated_mla_bwd_dq_bf16_opus")
+    dq_recomputed = launch_heads("_gated_mla_bwd_dkdvdq_bf16_opus")
 
     out, lse = gmt._gated_mla_fwd(q, kv, k_rot, gate, cu, smax, T.SCALE, causal, True)
     args = (q, kv, k_rot, gate, out, lse, dout, cu, smax, causal)
@@ -381,8 +425,9 @@ def test_gated_mla_bwd_ds_launches(heads, fit, launches, causal, monkeypatch):
     assert pair_ds == dq_ds == launches
     assert dq_recomputed == ([] if launches else [heads])
     assert all(n <= fit for n in pair_ds)
-    _assert_equal(ds, _bwd("separate", *args), '"ds" against "separate"')
-    _assert_parity(ds, T._ref_bwd(q, kv, k_rot, gate, dout, cu, causal))
+    ref = T._ref_bwd(q, kv, k_rot, gate, dout, cu, causal)
+    _assert_parity(ds, ref)
+    _assert_parity(_bwd("separate", *args), ref)
 
 
 def _within(x, front):
@@ -437,9 +482,10 @@ _LAYOUTS = {
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("layout", _LAYOUTS)
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_input_layouts(layout, causal):
     """Strided, sliced and unaligned views of the inputs give the gradients of contiguous
-    copies bit for bit, in both dQ modes."""
+    copies bit for bit, in each dQ mode."""
     seqlens, heads = [300, 1, 700], 17
     cu, smax, q, kv, k_rot, gate, dout = _inputs(seqlens, heads)
     x = {"q": q, "kv": kv, "k_rot": k_rot.contiguous(), "gate": gate, "dout": dout}
@@ -486,6 +532,7 @@ _SHARED_KV = [
 @pytest.mark.parametrize(
     "heads,kv_heads", _SHARED_KV, ids=[f"hq{h}_hk{k}" for h, k in _SHARED_KV]
 )
+@pytest.mark.usefixtures("dq_mode")
 def test_gated_mla_bwd_shared_kv(heads, kv_heads, causal):
     """GQA / MQA on kernels that take a KV row per query head: the shared KV is expanded to
     the query heads, as a stride-0 view when one KV head serves them all (MQA) and as a copy
@@ -528,8 +575,8 @@ def test_gated_mla_bwd_deterministic(seqlens, heads, mode, causal):
 
 @pytest.mark.parametrize("causal", [True, False])
 def test_gated_mla_train_dq_modes(causal):
-    """Module-level op: the gradients of q, kv_latent, k_rot, kv_b_weight and gate are the
-    same bits in both dQ modes and match fp32 autograd through the kv_b_proj expansion.
+    """Module-level op: the gradients of q, kv_latent, k_rot, kv_b_weight and gate match fp32
+    autograd through the kv_b_proj expansion in each dQ mode.
     """
     seqlens, heads = [300, 1, 700], 17
     cu, smax, q, _, k_rot, gate, dout = _inputs(seqlens, heads)
@@ -563,10 +610,9 @@ def test_gated_mla_train_dq_modes(causal):
         out, _ = T._ref_attention(qf, k, kv[..., T.D_NOPE :], gf, cu, causal)
         return torch.autograd.grad(out, xs, dout.float().view(out.shape))
 
-    sep, ds = grads("separate"), grads("ds")
-    differ = [n for n, x, y in zip(names, ds, sep) if not torch.equal(x, y)]
-    assert not differ, f'"ds" against "separate": {differ} differ'
-    _assert_parity(sep, ref_grads(), names)
+    ref = ref_grads()
+    _assert_parity(grads("separate"), ref, names)
+    _assert_parity(grads("ds"), ref, names)
 
 
 if __name__ == "__main__":

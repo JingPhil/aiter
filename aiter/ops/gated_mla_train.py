@@ -215,6 +215,54 @@ def _gated_mla_bwd_dkdv_bf16_opus(
 ) -> None: ...
 
 
+def _gated_mla_bwd_dkdvdq_bf16_opus_fake(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None:
+    return None
+
+
+# The backward past the pre-pass in one launch: the dK / dV pass and the dQ pass as workgroups of
+# one kernel. Writes `dq`, `dkv` (bf16) and `dk_rope` (fp32, per head) in place.
+@compile_ops(
+    "module_gated_mla_bwd_opus",
+    fc_name="gated_mla_bwd_dkdvdq_bf16_opus",
+    gen_fake=_gated_mla_bwd_dkdvdq_bf16_opus_fake,
+)
+def _gated_mla_bwd_dkdvdq_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    d_o: Tensor,
+    lse: Tensor,
+    d: Tensor,
+    dq: Tensor,
+    dkv: Tensor,
+    dk_rope: Tensor,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
 # As _gated_mla_bwd_dkdv_bf16_opus, on the 8-wave kernel whose wave pairs split by dependency chain.
 @compile_ops(
     "module_gated_mla_bwd_opus",
@@ -363,13 +411,15 @@ def _gated_mla_bwd_dq_bf16_opus(
 ) -> None: ...
 
 
-# How the backward computes dQ: "separate" runs a dQ pass that recomputes S and dP after the dK/dV
-# pass (the pair kernel); "ds" has the dK/dV pass also write dS, from which a GEMM makes dQ, where a
-# launch's dS buffer can hold enough heads (_ds_head_group), and falls back to "separate"
-# elsewhere; "atomic" adds dQ into an fp32 buffer from the dK/dV pass.
+# How the backward computes dQ: "separate" runs a dQ pass that recomputes S and dP beside the dK/dV
+# pass (both on 4 waves, one per SIMD, in one launch); "ds" has the dK/dV pass (the 8-wave pair kernel) also write
+# dS, from which a GEMM makes dQ, where a launch's dS buffer can hold enough heads
+# (_ds_head_group), and falls back to "separate" elsewhere; "atomic" adds dQ into an fp32 buffer
+# from the dK/dV pass. "separate" and "ds" give the same gradients bit for bit.
 # "ds" trades the recomputation for memory traffic (dS written and read back, 2 bytes per query-key
-# pair and head each way): 4 to 6% faster than "separate" on an MI350X from 2K to 32K tokens, slower
-# on small problems, and up to _BWD_DS_BUDGET more memory.
+# pair and head each way) and up to _BWD_DS_BUDGET more memory. On an MI350X "separate" is the
+# faster with its 4-wave passes: 3 to 10% from 512 to 16K tokens (against the 8-wave passes it had
+# before, "ds" was 4 to 6% faster from 2K to 32K tokens).
 _BWD_DQ_MODE = "separate"
 # Most bytes the "ds" mode's dS buffer may take; heads go in groups that fit.
 _BWD_DS_BUDGET = 16 << 30
@@ -387,7 +437,8 @@ def _clamp_sum(n: int, t: int) -> int:
 
 def _ds_tiles_per_head(seqlen_q: int, seqlen_k: int, causal: bool) -> int:
     """32 x 32 dS tiles one head of a sequence keeps (gated_mla_bwd_ds in gated_mla_bwd_opus_defs.h):
-    per key tile, its query tiles from the first one causal masking (bottom-right) lets see it."""
+    per key tile, its query tiles from the first one causal masking (bottom-right) lets see it.
+    """
     t, nk = (seqlen_q + 31) // 32, (seqlen_k + 31) // 32
     if not causal:
         return nk * t
@@ -401,7 +452,8 @@ def _ds_head_group(h: int, tiles_per_head: int) -> int:
     launch's heads over them in turn, so a launch holds a multiple of 8 heads (16 if they fit),
     each XCD then keeping to one or two heads at a time, the heads spread evenly over the fewest
     such launches; or 4 heads. Against recomputing dQ (96 heads, 32K and 64K): launches of 8 to 48
-    heads 3 to 4% faster, of 4 heads 1 to 2% faster, of 14, 3 or 2 heads up to 2% slower."""
+    heads 3 to 4% faster, of 4 heads 1 to 2% faster, of 14, 3 or 2 heads up to 2% slower.
+    """
     most = min(h, _BWD_DS_BUDGET // (max(1, tiles_per_head) * _DS_TILE_BYTES))
     if most >= h:
         return h
@@ -445,7 +497,19 @@ def _gated_mla_bwd(
     if _BWD_DQ_MODE == "atomic":
         dq_acc = torch.zeros(t, h, q.shape[-1], dtype=torch.float32, device=q.device)
         _gated_mla_bwd_bf16_opus(
-            q_k, k_nope, v, k_rot_k, d_o, lse, d, dq_acc, dkv, dk_rope, cu_seqlens, cu_seqlens, *args
+            q_k,
+            k_nope,
+            v,
+            k_rot_k,
+            d_o,
+            lse,
+            d,
+            dq_acc,
+            dkv,
+            dk_rope,
+            cu_seqlens,
+            cu_seqlens,
+            *args,
         )
         dq = dq_acc.to(q.dtype)
         return dq, dkv, dk_rope.sum(1).to(k_rot.dtype), dgate
@@ -457,7 +521,9 @@ def _gated_mla_bwd(
         per_head = max(1, sum(tiles))
         group = _ds_head_group(h, per_head)
     if group:
-        ds = torch.empty(group * per_head * _DS_TILE_BYTES // 2, dtype=q.dtype, device=q.device)
+        ds = torch.empty(
+            group * per_head * _DS_TILE_BYTES // 2, dtype=q.dtype, device=q.device
+        )
         ds_seq = None
         for h0 in range(0, h, group):
             hs = slice(h0, min(h, h0 + group))
@@ -468,18 +534,47 @@ def _gated_mla_bwd(
                     firsts.append(firsts[-1] + n_h * n)
                 ds_seq = torch.tensor(firsts, dtype=torch.int64, device=q.device)
             _gated_mla_bwd_dkdv_pair_ds_bf16_opus(
-                q_k[:, hs], k_nope[:, hs], v[:, hs], k_rot_k, d_o[:, hs], lse[hs], d[hs],
-                dkv[:, hs], dk_rope[:, hs], cu_seqlens, cu_seqlens, *args, ds, ds_seq,
+                q_k[:, hs],
+                k_nope[:, hs],
+                v[:, hs],
+                k_rot_k,
+                d_o[:, hs],
+                lse[hs],
+                d[hs],
+                dkv[:, hs],
+                dk_rope[:, hs],
+                cu_seqlens,
+                cu_seqlens,
+                *args,
+                ds,
+                ds_seq,
             )
             _gated_mla_bwd_dq_ds_bf16_opus(
-                k_nope[:, hs], k_rot_k, ds, ds_seq, dq[:, hs], cu_seqlens, cu_seqlens, *args
+                k_nope[:, hs],
+                k_rot_k,
+                ds,
+                ds_seq,
+                dq[:, hs],
+                cu_seqlens,
+                cu_seqlens,
+                *args,
             )
     else:
-        _gated_mla_bwd_dkdv_pair_bf16_opus(
-            q_k, k_nope, v, k_rot_k, d_o, lse, d, dkv, dk_rope, cu_seqlens, cu_seqlens, *args
-        )
-        _gated_mla_bwd_dq_bf16_opus(
-            q_k, k_nope, v, k_rot_k, d_o, lse, d, dq, cu_seqlens, cu_seqlens, *args
+        _gated_mla_bwd_dkdvdq_bf16_opus(
+            q_k,
+            k_nope,
+            v,
+            k_rot_k,
+            d_o,
+            lse,
+            d,
+            dq,
+            dkv,
+            dk_rope,
+            cu_seqlens,
+            cu_seqlens,
+            int(max_seqlen),
+            *args,
         )
     return dq, dkv, dk_rope.sum(1).to(k_rot.dtype), dgate
 

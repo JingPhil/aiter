@@ -226,6 +226,21 @@ __device__ inline wg_ids wg_map_sgpr(int wg, int H, int num_seqs, int n_blocks, 
 #ifndef GMLA_DQ_PP
 #define GMLA_DQ_PP 0
 #endif
+// The 4-wave backward's dS = P (dP - D): dP's accumulators start at -D, so that dP's MFMAs leave
+// dP - D and a tile's 24 subtractions go (1, the default), or they start at 0 and D is subtracted,
+// as the pair pass and the ASM kernels do it (0: "separate" then equals "ds" bit for bit). The two
+// differ in the order of dP's fp32 sums, an ulp of a bf16 result here and there: against gradients
+// computed in fp32 the error is the same to four digits (2.4e-3 relative L2 on dQ, dK and dV, as
+// the ASM backward's with fp32 dQ atomics).
+#ifndef GMLA_DP_MINUS_D
+#define GMLA_DP_MINUS_D 1
+#endif
+// 4-wave dK / dV pass: every read, VALU instruction and DMA round behind an MFMA at a unit of a
+// schedule (1, see gated_mla_bwd_4ws), or a tile as four blocks that each load their operands
+// first (0).
+#ifndef GMLA_4W_PP
+#define GMLA_4W_PP 1
+#endif
 // Pair pass: load phases and compute phases as the dQ pass's (1), or the stages A and B (0).
 #ifndef GMLA_PAIR_PP
 #define GMLA_PAIR_PP 0
@@ -4106,52 +4121,211 @@ __global__ __launch_bounds__(gated_mla_bwd_pair32::BLOCK, 1) void gated_mla_bwd_
     }
 }
 
-// dK / dV pass, 4 waves. Each wave runs at one per SIMD so that its 48 keys' K and V (A of
+// The 4-wave dK / dV loop's schedule (GMLA_4W_PP): what goes behind the MFMA of each unit of its four blocks
+// (S^T 36 units, dP^T 24, dK 36, dV 24). Element e of a tile's 24 S^T / dP^T values per lane is C tile (M tile
+// e / 8, N tile e / 4 % 2); its query's LSE and D have index (e / 4 % 2) 4 + e % 4.
+//   V_LSE x    LSE log2 e           V_FMA e    S^T scale - LSE      V_EXP e   its exp, P (fills a unit)
+//   V_SUB e    dP^T - D             V_MUL e    P (dP^T - D), dS in fp32
+//   V_NEG x    -D, index x (GMLA_DP_MINUS_D: dP^T starts at -D and there is no V_SUB; D is then read a tile
+//              ahead, in the dV units of V_DD, behind V_ALD)
+//   V_PP j     P's elements 2 j, 2 j + 1 to bf16 (A of dV)          V_PD j    dS's of the tile before (A of dK)
+//   V_AQ, V_ADO, V_ATDO, V_ALD   an LDS address a tile on; V_ATQ   Q^T's address from Q's
+//   R_Q f, R_O f   S^T's / dP^T's B fragment f (N tile, K step in N-tile-major order); R_TQ g, h / R_TO g, h
+//   Q^T's / dO^T's N tile g, half h; R_LS n, R_DD n   LSE / D of N tile n;   S_X  the DMA round of an S^T unit
+// A unit has room for two of VALU and read behind its MFMA (an exp is two, a DMA round both); the S^T block's
+// first 7 units take no VALU (it stands still behind the barrier). The dK and dV blocks' own reads are regular
+// and not in a table. S_EXPD: bit e set if element e's exp is in the S^T block (the mask of a tile not seen in
+// full is applied after it: those take P = 0, the others an S^T that exps to 0). The kernel reads the tables in
+// constant expressions only. Made and checked by a script (the dependencies and the units' room).
+namespace gated_mla_bwd_4ws {
+enum : signed char { V_NONE, V_LSE, V_FMA, V_EXP, V_SUB, V_MUL, V_PP, V_PD, V_AQ, V_ATQ, V_ADO, V_ATDO, V_ALD, V_NEG };
+enum : signed char { R_NONE, R_Q, R_O, R_TQ, R_TO, R_LS, R_DD };
+struct vop
+{
+    signed char k, e;
+};
+struct rop
+{
+    signed char k, a, b;
+};
+#if GMLA_DP_MINUS_D
+inline constexpr vop S_V[36][3] = {
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 0}, {V_LSE, 1}, {V_NONE, 0}},
+    {{V_LSE, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 3}, {V_PD, 0}, {V_NONE, 0}},
+    {{V_PD, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PD, 3}, {V_PD, 4}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 5}, {V_PD, 6}, {V_NONE, 0}},
+    {{V_FMA, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 7}, {V_PD, 8}, {V_NONE, 0}},
+    {{V_FMA, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 9}, {V_PD, 10}, {V_NONE, 0}}, {{V_FMA, 2}, {V_FMA, 3}, {V_NONE, 0}},
+    {{V_FMA, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 11}, {V_LSE, 4}, {V_NONE, 0}}, {{V_FMA, 9}, {V_FMA, 10}, {V_NONE, 0}},
+    {{V_FMA, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 16}, {V_FMA, 17}, {V_NONE, 0}}, {{V_FMA, 18}, {V_FMA, 19}, {V_NONE, 0}},
+    {{V_LSE, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 6}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_LSE, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop S_R[36] = {
+    {R_Q, 2, 0}, {R_NONE, 0, 0}, {R_LS, 0, 0}, {R_Q, 3, 0}, {R_NONE, 0, 0}, {R_LS, 1, 0},
+    {R_Q, 4, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 6, 0}, {R_NONE, 0, 0}, {R_Q, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 8, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 9, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 10, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 11, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 0, 0}, {R_NONE, 0, 0}, {R_O, 1, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop P_V[24][3] = {
+    {{V_EXP, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 3}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 9}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 6}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 17}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 13}, {V_MUL, 0}, {V_NONE, 0}},
+    {{V_FMA, 14}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 15}, {V_MUL, 1}, {V_NONE, 0}}, {{V_FMA, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 22}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 5}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop P_R[24] = {
+    {R_NONE, 0, 0}, {R_O, 2, 0}, {R_NONE, 0, 0}, {R_O, 3, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 4, 0}, {R_NONE, 0, 0}, {R_O, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 6, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_O, 7, 0}, {R_NONE, 0, 0}, {R_TQ, 0, 0},
+    {R_TQ, 0, 1}, {R_TQ, 1, 0}, {R_TQ, 1, 1}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop K_V[36][3] = {
+    {{V_MUL, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 6}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 12}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 13}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 14}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 15}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 6}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 21}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 22}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 4}, {V_MUL, 5}, {V_NONE, 0}},
+    {{V_MUL, 6}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 12}, {V_MUL, 13}, {V_NONE, 0}},
+};
+inline constexpr vop V_V[24][3] = {
+    {{V_ALD, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 14}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 15}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 20}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 22}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NEG, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NEG, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NEG, 2}, {V_NEG, 3}, {V_NONE, 0}},
+    {{V_NEG, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NEG, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NEG, 6}, {V_NEG, 7}, {V_NONE, 0}},
+    {{V_ATQ, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_AQ, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_ADO, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 23}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_ATDO, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr signed char S_X[36] = {-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5, -1, -1, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+inline constexpr unsigned int S_EXPD = 0x000003;
+inline constexpr signed char V_DD[24] = {-1, -1, 0, -1, -1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+#else
+inline constexpr vop S_V[36][3] = {
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 0}, {V_LSE, 1}, {V_NONE, 0}},
+    {{V_LSE, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 3}, {V_PD, 0}, {V_NONE, 0}},
+    {{V_PD, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PD, 3}, {V_PD, 4}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 5}, {V_PD, 6}, {V_NONE, 0}},
+    {{V_FMA, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 7}, {V_PD, 8}, {V_NONE, 0}},
+    {{V_FMA, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 9}, {V_PD, 10}, {V_NONE, 0}}, {{V_FMA, 2}, {V_FMA, 3}, {V_NONE, 0}},
+    {{V_FMA, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PD, 11}, {V_LSE, 4}, {V_NONE, 0}}, {{V_FMA, 9}, {V_FMA, 10}, {V_NONE, 0}},
+    {{V_FMA, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 16}, {V_FMA, 17}, {V_NONE, 0}}, {{V_FMA, 18}, {V_FMA, 19}, {V_NONE, 0}},
+    {{V_LSE, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_LSE, 6}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_LSE, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop S_R[36] = {
+    {R_Q, 2, 0}, {R_NONE, 0, 0}, {R_LS, 0, 0}, {R_Q, 3, 0}, {R_NONE, 0, 0}, {R_LS, 1, 0},
+    {R_Q, 4, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 6, 0}, {R_NONE, 0, 0}, {R_Q, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 8, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 9, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_Q, 10, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_Q, 11, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 0, 0}, {R_NONE, 0, 0}, {R_O, 1, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop P_V[24][3] = {
+    {{V_EXP, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 3}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 9}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 6}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 17}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 13}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 14}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 15}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 22}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 5}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop P_R[24] = {
+    {R_NONE, 0, 0}, {R_O, 2, 0}, {R_NONE, 0, 0}, {R_O, 3, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 4, 0}, {R_NONE, 0, 0}, {R_O, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_O, 6, 0}, {R_NONE, 0, 0}, {R_DD, 0, 0}, {R_O, 7, 0}, {R_DD, 1, 0}, {R_TQ, 0, 0},
+    {R_TQ, 0, 1}, {R_TQ, 1, 0}, {R_TQ, 1, 1}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop K_V[36][3] = {
+    {{V_SUB, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 6}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 12}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 13}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 14}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 15}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 21}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 22}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PP, 6}, {V_SUB, 12}, {V_NONE, 0}}, {{V_PP, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PP, 10}, {V_SUB, 4}, {V_NONE, 0}},
+    {{V_SUB, 5}, {V_SUB, 13}, {V_NONE, 0}}, {{V_SUB, 6}, {V_SUB, 14}, {V_NONE, 0}}, {{V_PP, 11}, {V_SUB, 7}, {V_NONE, 0}},
+};
+inline constexpr vop V_V[24][3] = {
+    {{V_MUL, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 15}, {V_SUB, 20}, {V_NONE, 0}},
+    {{V_MUL, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 21}, {V_SUB, 22}, {V_NONE, 0}},
+    {{V_MUL, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 23}, {V_ATQ, 0}, {V_NONE, 0}},
+    {{V_MUL, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_AQ, 0}, {V_ADO, 0}, {V_NONE, 0}},
+    {{V_MUL, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 18}, {V_MUL, 19}, {V_NONE, 0}},
+    {{V_MUL, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 6}, {V_MUL, 7}, {V_NONE, 0}},
+    {{V_MUL, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 13}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 14}, {V_MUL, 15}, {V_NONE, 0}},
+    {{V_MUL, 20}, {V_MUL, 21}, {V_NONE, 0}}, {{V_MUL, 22}, {V_MUL, 23}, {V_NONE, 0}}, {{V_ATDO, 0}, {V_ALD, 0}, {V_NONE, 0}},
+};
+inline constexpr signed char S_X[36] = {-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5, -1, -1, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+inline constexpr unsigned int S_EXPD = 0x000003;
+inline constexpr signed char V_DD[24] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+#endif
+}  // namespace gated_mla_bwd_4ws
+
+// dK / dV pass of the 4-wave backward. Each wave runs at one per SIMD so that its 48 keys' K and V (A of
 // S^T and dP^T) stay in VGPRs and dK and dV in AGPRs: every LDS fragment of Q and dO feeds
 // three M tiles. GEMMs are per wave, C = A * B^T, all 16x16x32 MFMAs: S^T and dP^T over d; dV
 // and dK over the tile's 32 queries, with P^T and dS^T (the C fragments of S^T and dP^T, two N
 // tiles per M tile) as their A operands and transposed reads of the dO and Q tiles as B. Query
-// tiles go global -> LDS one tile ahead into the other buffer, one barrier per tile.
-__global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv_4w_kernel(gated_mla_bwd_kargs k)
+// tiles go global -> LDS by DMA two tiles ahead into a ring of four buffers, one barrier per tile.
+__device__ __attribute__((always_inline)) inline void gated_mla_bwd_dkdv_4w_body(
+    const gated_mla_bwd_4w_kargs& k, gated_mla_bwd::bf16_t* smem, const int lane, const int w, const int h, const int j,
+    unsigned long long bnd_q, unsigned long long bnd_k, gated_mla_bwd::f32x4_t (&z)[3][12])
 {
     using namespace gated_mla_bwd_4w;
-    using gated_mla_bwd::acc_gemm32;
     using gated_mla_bwd::bf16_t;
     using gated_mla_bwd::bvec;
     using gated_mla_bwd::f32x4_t;
     using gated_mla_bwd::mfma_acc_drain;
-    using gated_mla_bwd::tr_load_b_c_order;
     using opus::number;
     using opus::operator""_I;
     using vec8_t = bvec<8>;
     constexpr float LOG2_E = 1.44269504089f;
     constexpr int MR       = WR / 16;  // M tiles per wave
     constexpr int NT       = BQ / 16;  // N tiles of S^T / dP^T
-    __shared__ __attribute__((aligned(16))) bf16_t smem[SMEM_ELEMS];
-    // LSE and D of a query tile, [lse | D], double-buffered like sQ.
-    __shared__ __attribute__((aligned(16))) float s_ld[2][2 * BQ];
+    // dK's accumulators, [M tile][N tile] in the swap_ab C layout, in AGPRs: the kernel's zeros.
+    constexpr int NV = D_V / 16, NR = D_ROT / 16;
+    static_assert(MR == 3 && NV + NR == 12, "the kernel's zeroed tiles");
+    f32x4_t acc_dkn[MR][NV], acc_dkr[MR][NR];
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+    {
+#pragma unroll
+        for(int n = 0; n < NV; n++)
+            acc_dkn[m][n] = z[m][n];
+#pragma unroll
+        for(int n = 0; n < NR; n++)
+            acc_dkr[m][n] = z[m][NV + n];
+    }
 
-    const int tid  = static_cast<int>(opus::thread_id_x());
-    const int lane = tid % 64;
-    const int w    = __builtin_amdgcn_readfirstlane(tid / 64);
-    // Workgroup id -> (head, sequence, key block): gated_mla_bwd::wg_map.
-    const int wg   = static_cast<int>(opus::block_id_x());
-    const auto ids = gated_mla_bwd::wg_map_sgpr(wg, k.H, k.num_seqs, k.n_kv_blocks, k.hg);
-    const int h = ids.h, g = ids.g, j = ids.blk;
-    auto sc            = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
-    const int q0       = sc(k.ptr_seqstart_q[g]);
-    const int k0       = sc(k.ptr_seqstart_k[g]);
-    const int seqlen_q = sc(k.ptr_seqstart_q[g + 1]) - q0;
-    const int seqlen_k = sc(k.ptr_seqstart_k[g + 1]) - k0;
-    const int kv0      = j * BK;
-    if(kv0 >= seqlen_k)
-        return;
-    // Bottom-right causal: query qp sees keys kv <= qp + causal_offset.
-    const int causal_offset = seqlen_k - seqlen_q;
-    const int n_q_tiles     = (seqlen_q + BQ - 1) / BQ;
-    int i_begin             = 0;
-    if(k.causal && kv0 - causal_offset > 0)
-        i_begin = (kv0 - causal_offset) / BQ;
+    // The tensors' bases at this head.
+    const bf16_t* q_h  = reinterpret_cast<const bf16_t*>(k.ptr_q) + static_cast<long long>(h) * k.stride_q_h;
+    const bf16_t* do_h = reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(h) * k.stride_do_h;
+    const bf16_t* kn_h = reinterpret_cast<const bf16_t*>(k.ptr_k_nope) + static_cast<long long>(h) * k.stride_k_h;
+    const bf16_t* v_h  = reinterpret_cast<const bf16_t*>(k.ptr_v) + static_cast<long long>(h) * k.stride_v_h;
+    const float* ld_h  = (w % 2 == 0 ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h;
+    asm volatile("" : "+s"(q_h), "+s"(do_h), "+s"(kn_h), "+s"(v_h), "+s"(ld_h));
 
     auto make_mma = [](auto e_m, auto e_n, auto e_k) {
         return opus::make_tiled_mma<bf16_t, bf16_t, float>(
@@ -4179,22 +4353,355 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
             __builtin_amdgcn_readfirstlane((rows < 0 ? 0 : (rows > cap ? cap : rows)) * row_bytes));
     };
 
-    // This wave's 48 keys as the A operand of S^T and dP^T; rows past seqlen_k read as 0.
+    // C element e = (m NT + tn) 4 + p of S^T / dP^T is key 16 m + lane % 16 of the wave and
+    // query 16 tn + 4 (lane / 16) + p of the tile.
+    constexpr int NS = decltype(mma_s)::tile_c_len;
+    static_assert(NS == MR * NT * 4);
+    constexpr int KS = D_QK / 32, KS_N = D_NOPE / 32, KS_R = D_ROT / 32;
+    const int c_q = 4 * (lane / 16);
+
+    // One wave per SIMD: behind an MFMA the wave issues one scalar (or wait) and two of LDS read
+    // and VALU (an exp is two, a DMA round takes both). An iteration (S^T tile ts) is 120 such
+    // units; what each does is in gated_mla_bwd_4ws:
+    //   barrier               every wave is past its reads of tile ts - 2, tile ts + 1 is whole
+    //   S^T(ts)      36 MFMA  the 7 DMA rounds of tile ts + 2 into tile ts - 2's buffer, Q's
+    //                         fragments two ahead, LSE and LSE log2 e, dS of tile ts - 1 to bf16,
+    //                         the loop's scalars, S^T scale - LSE of the C tiles done mid block
+    //   dP^T(ts)     24 MFMA  the other S^T scale - LSE, half of the exps, D
+    //   dK(ts - 1)   36 MFMA  Q^T's fragments two N tiles ahead; the other exps, dP^T - D, P to
+    //                         bf16 for dV
+    //   dV(ts)       24 MFMA  dO^T's fragments two N tiles ahead; dS = P (dP^T - D) in fp32, the
+    //                         LDS addresses a tile on
+    // S^T and dP^T go N tile by N tile (a B fragment serves three consecutive MFMAs, one per M
+    // tile), so half their C tiles are done mid block. dK runs a tile behind so that the VALU
+    // work between S^T and dS has the MFMAs of dP^T, dK and dV to go behind. No MFMA waits for
+    // LDS: every fragment is read two fragments or two N tiles ahead into registers the ones
+    // before left free. dS = P (dP^T - D): dP^T's accumulators start at -D (GMLA_DP_MINUS_D; D is
+    // then read and negated a tile ahead, in the dV block), or at 0 with D subtracted as the pair
+    // pass does it, bit for bit. Query tiles (Q, dO, LSE, D) go global -> LDS by DMA into 4
+    // buffers.
+    constexpr int XB_Q = 0, XB_DO = BQ * LD_Q, XB_LSE = XB_DO + BQ * LD_DO, XB_D = XB_LSE + 128;
+    constexpr int XB_SZ = XB_D + 128, XNB = 4;
+    static_assert(XNB * XB_SZ <= SMEM_ELEMS, "four tile buffers");
+    auto pin    = [](auto& x) { asm volatile("" : "+v"(x)); };
+    auto fence  = [] { __builtin_amdgcn_sched_barrier(0); };
+    float sc2   = k.softmax_scale * LOG2_E;  // the scale in a VGPR, for the asm fma
+    pin(sc2);
+    // A fragment the next MFMA reads, named right behind this one: the compiler puts its wait
+    // for the LDS read (s_waitcnt lgkmcnt) before the first use, which is then here, in the
+    // cycles the MFMA leaves to scalars, not in front of the next MFMA.
+    auto touch  = [](const auto& x) { asm volatile("" : : "v"(x)); };
+    auto touch2 = [](const auto& x, const auto& y) { asm volatile("" : : "v"(x), "v"(y)); };
+    auto lds_of = [&](int b) { return gated_mla_bwd::lds_addr(smem + b); };
+
+    // DMA: a load is 64 lanes x 16 B from a tile laid out with the row padding, to a wave-uniform
+    // LDS address: load jj of a tensor covers its 16-byte slots 64 jj .. + 63, slot s being row
+    // s / QS, chunk s % QS of Q (s / DS, s % DS of dO); padding chunks and rows past seqlen_q read
+    // out of bounds, as 0. Wave w issues the tile's loads w + NW u, u = 0 .. 5 (13 of Q then 9 of
+    // dO; a load past them repeats the wave's last one) and, as round 6, LSE (even w) or D.
+    // Rounds 0 .. 2 load Q, 4 and 5 dO, round 3 Q's last load for wave 0 and dO for the others:
+    // four descriptors, each pointing at the tile to load (base; size a full tile's, or what
+    // x_sizes sets for the sequence's last, partial tile and the tiles past it).
+    constexpr int XR = 7, J_Q = 13, J_D = 9;
+    constexpr int QS = LD_Q * 2 / 16, DS = LD_DO * 2 / 16;  // 16-byte slots per padded row
+    constexpr int OOB = 1 << 30;                            // byte offset past any tile
+    static_assert(BQ * QS == J_Q * 64 && BQ * DS == J_D * 64 && NW == 4, "the rounds below");
+    // The lanes' byte offsets of load jj (jj wave-uniform; the divisors are constants).
+    auto os_q = [&](int jj) {
+        const unsigned int sl = 64u * jj + lane, c = sl % QS;
+        const int in = -static_cast<int>(c < D_QK / 8);  // all ones in a chunk of the row, 0 in its padding
+        return (static_cast<int>(sl / QS * (k.stride_q_n * 2) + c * 16) & in) | (OOB & ~in);
+    };
+    auto os_d = [&](int jj) {
+        const unsigned int sl = 64u * jj + lane, c = sl % DS;
+        const int in = -static_cast<int>(c < D_V / 8);  // all ones in a chunk of the row, 0 in its padding
+        return (static_cast<int>(sl / DS * (k.stride_do_n * 2) + c * 16) & in) | (OOB & ~in);
+    };
+    const bool r3q = w == 0;
+    const int j5   = w < 2 ? w + 7 : w + 3;
+    // readfirstlane: the compiler makes these selects in VALU, with the lanes' offsets'.
+    auto u_lds = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+    int x_lds[XR], x_os[XR];
+#pragma unroll
+    for(int u = 0; u < 3; u++)
+    {
+        x_lds[u] = u_lds(XB_Q * 2 + (w + NW * u) * 1024);
+        x_os[u]  = os_q(w + NW * u);
+    }
+    x_lds[3] = u_lds(r3q ? XB_Q * 2 + 12 * 1024 : XB_DO * 2 + (w - 1) * 1024);
+    x_os[3]  = r3q ? os_q(12) : os_d(w - 1);
+    x_lds[4] = u_lds(XB_DO * 2 + (w + 3) * 1024);
+    x_os[4]  = os_d(w + 3);
+    x_lds[5] = u_lds(XB_DO * 2 + j5 * 1024);
+    x_os[5]  = os_d(j5);
+    x_lds[6] = u_lds((w % 2 == 0 ? XB_LSE : XB_D) * 2);
+    x_os[6]  = lane * 4;
+#pragma unroll
+    for(int u = 0; u < XR; u++)
+    {
+        asm volatile("" : "+s"(x_lds[u]));
+        pin(x_os[u]);
+    }
+
+    // Fragments of one K step or N tile, at a per-lane LDS address plus an immediate.
+    auto mma_k1    = make_mma(number<MR>{}, number<NT>{}, number<1>{});
+    auto lay_b     = [&](auto ld, const auto& c) { return opus::partition_layout_b<8>(mma_k1, opus::make_tuple(ld, 1_I), c); };
+    const auto c_0 = opus::make_tuple(0_I, 0_I, 0_I, 0_I);
+    const auto of_q  = opus::layout_to_offsets<8>(lay_b(number<LD_Q>{}, c_0));
+    const auto of_do = opus::layout_to_offsets<8>(lay_b(number<LD_DO>{}, c_0));
+    const int ob_q   = (opus::layout_to_offsets<8>(lay_b(number<LD_Q>{}, c_ab))[0] - of_q[0]) * 2;
+    const int ob_do  = (opus::layout_to_offsets<8>(lay_b(number<LD_DO>{}, c_ab))[0] - of_do[0]) * 2;
+    const int ob_tq  = gated_mla_bwd::tr_c_order_lane<LD_Q>(lane) * 2;
+    const int ob_tdo = gated_mla_bwd::tr_c_order_lane<LD_DO>(lane) * 2;
+    const int ob_ld  = 16 * (lane / 16);  // this lane's float4 run of LSE or D
+    int c_tq         = ob_tq - ob_q;      // Q^T's per-lane address is Q's plus this
+    pin(c_tq);
+    auto at   = [](unsigned int a) { return opus::make_smem(reinterpret_cast<bf16_t*>(static_cast<__UINTPTR_TYPE__>(a))); };
+    auto at_f = [](unsigned int a) { return opus::make_smem(reinterpret_cast<float*>(static_cast<__UINTPTR_TYPE__>(a))); };
+    // An operand's address in buffer b: the scalar part in SALU, one v_add.
+    auto addr = [&](int b, int off, int ob) {
+        unsigned int sb = gated_mla_bwd::lds_addr(smem + b + off);
+        asm volatile("" : "+s"(sb));
+        unsigned int a = sb + static_cast<unsigned int>(ob);
+        pin(a);
+        return a;
+    };
+    // The first tile is in buffer 0. The first dK block is of no tile (its dS is 0, but what it
+    // reads must be finite): it reads the first tile's Q^T too.
+    unsigned int a_q = addr(0, XB_Q, ob_q), a_do = addr(0, XB_DO, ob_do), a_tdo = addr(0, XB_DO, ob_tdo);
+    unsigned int a_ld = addr(0, XB_LSE, ob_ld), a_tq = addr(0, XB_Q, ob_tq);
+    auto rd_q  = [&](int tn, int ks) __attribute__((always_inline)) -> bvec<8> { return at(a_q).template load<8>(of_q[tn] + ks * 32); };
+    auto rd_do = [&](int tn, int ks) __attribute__((always_inline)) -> bvec<8> { return at(a_do).template load<8>(of_do[tn] + ks * 32); };
+    // One transposed read of N tile gn (16 columns) of Q or dO, half hh of the tile's 32 queries.
+    auto rd_tq = [&](int gn, int hh) __attribute__((always_inline)) { return gated_mla_bwd::tr_read(at(a_tq), gn * 16 + hh * 16 * LD_Q); };
+    auto rd_to = [&](int gn, int hh) __attribute__((always_inline)) { return gated_mla_bwd::tr_read(at(a_tdo), gn * 16 + hh * 16 * LD_DO); };
+    using u32x2_t = gated_mla_bwd::u32x2_t;
+    using u32x4_t = gated_mla_bwd::u32x4_t;
+    auto b_tr = [](const u32x2_t (&hv)[2]) __attribute__((always_inline)) { return u32x4_t{hv[0][0], hv[0][1], hv[1][0], hv[1][1]}; };
+    // An MFMA of dV or dK, its accumulator in AGPRs.
+    auto acc1 = [](f32x4_t& acc, const u32x4_t& a, const u32x4_t& b) __attribute__((always_inline)) {
+        asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %0" : "+a"(acc) : "v"(a), "v"(b));
+    };
+    auto barrier = [&] {
+        fence();
+        __builtin_amdgcn_s_barrier();
+        fence();
+    };
+    constexpr int KSV = D_V / 32, NG = NV + NR;
+    static_assert(MR == 3 && NT == 2 && KS == 6 && KSV == 4 && NV == 8 && NG == 12 && NS == 24, "the schedule's shape");
+
+    bvec<8> bq[3], bdo[3];  // B fragments of S^T and dP^T: the one in use and the next two
+    u32x2_t tb[3][2];       // B of dK and dV: this N tile's two reads and the next two's
+    opus::vector_t<float, NS> v_sp, v_dp;
+    opus::vector_t<bf16_t, MR * 8> a_p, a_ds;
+    f32x4_t lse4[NT], d4[NT];
+    f32x4_t c_old{0.0f, 0.0f, 0.0f, 0.0f};  // what a C tile's last MFMA accumulates onto
+#pragma unroll
+    for(int e = 0; e < NS; e++)
+    {
+        v_sp[e] = 0.0f;  // P and dS of the tile before the first are 0
+        v_dp[e] = 0.0f;
+    }
+    // One MFMA of S^T (va is K, vacc S^T) or dP^T (V, dP^T) onto C tile tl. The first K step
+    // (step 0, from 0) and the steps between (1, in place) are asm; the last (2) is the
+    // compiler's MFMA. The compiler's may put its result in other registers and hand the old ones
+    // to the next instruction that needs some (an LDS read), which then stands s_nop behind the
+    // MFMA that reads them: the old ones (c_old) are kept to the end of the unit after.
+    auto mm = [&](const auto& va, int ia, const bvec<8>& fb, auto& vacc, int tl, int step, const f32x4_t* c0 = nullptr) __attribute__((always_inline)) {
+        bvec<8> fa;
+        f32x4_t cc;
+#pragma unroll
+        for(int x = 0; x < 8; x++)
+            fa[x] = va[ia * 8 + x];
+        if(step == 0)
+        {
+            // From 0, or from what the accumulator starts at (c0: -D for dP).
+            if(c0)
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %3" : "=&v"(cc) : "v"(fa), "v"(fb), "v"(*c0));
+            else
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, 0" : "=&v"(cc) : "v"(fa), "v"(fb));
+        }
+        else
+        {
+#pragma unroll
+            for(int p_ = 0; p_ < 4; p_++)
+                cc[p_] = vacc[tl * 4 + p_];
+            if(step == 1)
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %0" : "+v"(cc) : "v"(fa), "v"(fb));
+            else
+            {
+                c_old = cc;
+                cc    = mma1(fa, fb, cc);
+                asm volatile("" : "+v"(cc));
+            }
+        }
+#pragma unroll
+        for(int p_ = 0; p_ < 4; p_++)
+            vacc[tl * 4 + p_] = cc[p_];
+    };
+    // The VALU of a unit is asm, as its first MFMAs are: a unit's instructions then stand in the
+    // order they are written (the compiler's own VALU goes where ISel and the scheduler put it:
+    // a unit early, or in front of the unit's read, which then issues 12 cycles late). What is
+    // left to the compiler in the loop: the LDS reads (chained between the asm around them), the
+    // last K step's MFMA, the descriptors' 64-bit steps and the waits. It does not know these
+    // VALU read what an MFMA wrote: the schedule keeps them 3 units behind that MFMA. They are
+    // the instructions the compiler makes of the pair pass's expressions.
+    auto pack = [&](const opus::vector_t<float, NS>& v, opus::vector_t<bf16_t, MR * 8>& o, int j) __attribute__((always_inline)) {
+        opus::vector_t<bf16_t, 2> h2;
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(h2) : "v"(v[2 * j]), "v"(v[2 * j + 1]));
+        o[2 * j]     = h2[0];
+        o[2 * j + 1] = h2[1];
+    };
+    auto lse1 = [&](int x) __attribute__((always_inline)) {  // LSE log2 e (0x3fb8aa3b)
+        float l = lse4[x / 4][x % 4];
+        asm volatile("v_mul_f32 %0, 0x3fb8aa3b, %0" : "+v"(l));
+        lse4[x / 4][x % 4] = l;
+    };
+    auto fma1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_sp[e];
+        asm volatile("v_fma_f32 %0, %0, %1, -%2" : "+v"(x) : "v"(sc2), "v"(lse4[e / 4 % NT][e % 4]));
+        v_sp[e] = x;
+    };
+    auto expa = [&](int e) __attribute__((always_inline)) {
+        float x = v_sp[e];
+        asm volatile("v_exp_f32_e32 %0, %0" : "+v"(x));
+        v_sp[e] = x;
+    };
+    auto sub1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_dp[e];
+        asm volatile("v_sub_f32 %0, %0, %1" : "+v"(x) : "v"(d4[e / 4 % NT][e % 4]));
+        v_dp[e] = x;
+    };
+    // -D of query index x, in place: D's sign bit (GMLA_DP_MINUS_D).
+    auto neg1 = [&](int x) __attribute__((always_inline)) {
+        float nd = d4[x / 4][x % 4];
+        asm volatile("v_xor_b32 %0, 0x80000000, %0" : "+v"(nd));
+        d4[x / 4][x % 4] = nd;
+    };
+    auto mul1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_dp[e];
+        asm volatile("v_mul_f32 %0, %1, %0" : "+v"(x) : "v"(v_sp[e]));
+        v_dp[e] = x;
+    };
+
+    // The bounds are in.
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+s"(bnd_q), "+s"(bnd_k));
+    const int q0 = static_cast<int>(bnd_q), k0 = static_cast<int>(bnd_k);
+    const int seqlen_q = static_cast<int>(bnd_q >> 32) - q0, seqlen_k = static_cast<int>(bnd_k >> 32) - k0;
+    const int kv0      = j * BK;
+    // A block past the sequence's keys has nothing to do. (No early return: the two bodies are
+    // then a plain if / else, with nothing of one live across the other.)
+    if(kv0 < seqlen_k)
+    {
+    // Bottom-right causal: query qp sees keys kv <= qp + causal_offset. The block's keys see
+    // (part of) query tiles i0 .. T - 1; with no query at all the loop runs one tile of zeros.
+    const int causal_offset = seqlen_k - seqlen_q;
+    const int T             = (seqlen_q + BQ - 1) / BQ;
+    int i0                  = 0;
+    if(k.causal && kv0 - causal_offset > 0)
+        i0 = (kv0 - causal_offset) / BQ;
+    // This wave's 48 keys; rows past seqlen_k read as 0.
     const int row_w  = kv0 + w * WR;
     const int rows_w = seqlen_k - row_w < WR ? (seqlen_k - row_w > 0 ? seqlen_k - row_w : 0) : WR;
-    auto g_kn = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_k_nope) + static_cast<long long>(k0 + row_w) * k.stride_k_n +
-                                    static_cast<long long>(h) * k.stride_k_h,
+    const int c_kv   = row_w + lane % 16;
+
+    // The tiles from if0 on are those this wave's keys all see under the causal mask; the ones
+    // before take a mask. Nothing else does: rows past seqlen_k and past seqlen_q read as 0 (K, V;
+    // Q, dO, LSE, D), and what they make stays in dK / dV rows that are not stored (keys) or is 0
+    // (queries: dO and D - dP^T).
+    int if0 = 0;
+    if(k.causal && rows_w > 0)
+    {
+        const int need = row_w + rows_w - 1 - causal_offset;
+        if0 = need > 0 ? (need + BQ - 1) / BQ : 0;
+    }
+    asm volatile("" : "+s"(if0));
+
+    const bf16_t* q_ptr  = q_h + static_cast<long long>(q0) * k.stride_q_n;
+    const bf16_t* do_ptr = do_h + static_cast<long long>(q0) * k.stride_do_n;
+    // readfirstlane: as above (the lanes' offsets use the same products).
+    const int x_rb[4] = {__builtin_amdgcn_readfirstlane(k.stride_q_n * 2),
+                         __builtin_amdgcn_readfirstlane((r3q ? k.stride_q_n : k.stride_do_n) * 2),
+                         __builtin_amdgcn_readfirstlane(k.stride_do_n * 2), 4};
+    const char* x_src[4] = {reinterpret_cast<const char*>(q_ptr),
+                            r3q ? reinterpret_cast<const char*>(q_ptr) : reinterpret_cast<const char*>(do_ptr),
+                            reinterpret_cast<const char*>(do_ptr),
+                            reinterpret_cast<const char*>(ld_h + q0)};
+    int x_kb[4];
+    gated_mla_bwd::i32x4_t x_rs[4];
+#pragma unroll
+    for(int d = 0; d < 4; d++)
+    {
+        x_kb[d] = BQ * x_rb[d];
+        x_rs[d] = gated_mla_bwd::dma_rsrc(x_src[d] + static_cast<long long>(i0) * BQ * x_rb[d], 0);
+        asm volatile("" : "+s"(x_kb[d]), "+s"(x_rs[d]));
+    }
+    auto x_sizes = [&](int t) {
+        int rows = seqlen_q - t * BQ;
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(rows) : "n"(BQ) : "scc");
+#pragma unroll
+        for(int d = 0; d < 4; d++)
+        {
+            int nb;
+            asm("s_mul_i32 %0, %1, %2" : "=s"(nb) : "s"(rows), "s"(x_rb[d]));
+            x_rs[d] = gated_mla_bwd::i32x4_t{x_rs[d][0], x_rs[d][1], nb, 0x00020000};
+            asm volatile("" : "+s"(x_rs[d]));
+        }
+    };
+    auto x_adv = [&](int d) __attribute__((always_inline)) {
+        auto& r = x_rs[d];
+        asm volatile("" : "+s"(r));
+        unsigned long long a =
+            static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
+        a += static_cast<unsigned long long>(static_cast<unsigned int>(x_kb[d]));
+        r = gated_mla_bwd::i32x4_t{static_cast<int>(a), static_cast<int>(a >> 32), r[2], r[3]};
+        asm volatile("" : "+s"(r));
+    };
+    auto x_go = [&](int u, unsigned int lb) __attribute__((always_inline)) {
+        const int d = u < 3 ? 0 : (u == 3 ? 1 : (u < XR - 1 ? 2 : 3));
+        if(u == XR - 1)
+            asm volatile("s_add_u32 m0, %2, %3\n\tbuffer_load_dword %0, %1, 0 offen lds"
+                         :
+                         : "v"(x_os[u]), "s"(x_rs[d]), "s"(lb), "s"(x_lds[u])
+                         : "m0", "scc");
+        else
+            asm volatile("s_add_u32 m0, %2, %3\n\tbuffer_load_dwordx4 %0, %1, 0 offen lds"
+                         :
+                         : "v"(x_os[u]), "s"(x_rs[d]), "s"(lb), "s"(x_lds[u])
+                         : "m0", "scc");
+    };
+
+    // The first two tiles to LDS (buffers 0 and 1), ahead of K and V: the memory pipeline is at
+    // them while the 30 loads of K and V are issued.
+    {
+        unsigned int lb0 = lds_of(0), lb1 = lds_of(XB_SZ);
+        asm volatile("" : "+s"(lb0), "+s"(lb1));
+        x_sizes(i0);
+#pragma unroll
+        for(int u = 0; u < XR; u++)
+            x_go(u, lb0);
+#pragma unroll
+        for(int d = 0; d < 4; d++)
+            x_adv(d);
+        x_sizes(i0 + 1);
+#pragma unroll
+        for(int u = 0; u < XR; u++)
+            x_go(u, lb1);
+        // Descriptor 0 goes a tile on past its rounds, the others in front of theirs.
+        x_adv(0);
+        x_sizes(i0 + 2);
+    }
+    // This wave's keys as the A operand of S^T and dP^T, in registers.
+    auto g_kn = opus::make_gmem(kn_h + static_cast<long long>(k0 + row_w) * k.stride_k_n,
                                 rec(static_cast<long long>(rows_w) * k.stride_k_n, 2));
     auto g_kr = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_k_rot) + static_cast<long long>(k0 + row_w) * k.stride_k_rot_n,
                                 rec(static_cast<long long>(rows_w) * k.stride_k_rot_n, 2));
-    auto g_v  = opus::make_gmem(reinterpret_cast<const bf16_t*>(k.ptr_v) + static_cast<long long>(k0 + row_w) * k.stride_v_n +
-                                    static_cast<long long>(h) * k.stride_v_h,
+    auto g_v  = opus::make_gmem(v_h + static_cast<long long>(k0 + row_w) * k.stride_v_n,
                                 rec(static_cast<long long>(rows_w) * k.stride_v_n, 2));
     const auto v_kn = g_kn.template load<8>(opus::partition_layout_a<8>(mma_kn, opus::make_tuple(k.stride_k_n, 1_I), c_ab));
     const auto v_kr = g_kr.template load<8>(opus::partition_layout_a<8>(mma_kr, opus::make_tuple(k.stride_k_rot_n, 1_I), c_ab));
     const auto v_vw = g_v.template load<8>(opus::partition_layout_a<8>(mma_dp, opus::make_tuple(k.stride_v_n, 1_I), c_ab));
     // A of S^T is [M tile][K step][8]; nope and rope interleave per M tile.
-    constexpr int KS = D_QK / 32, KS_N = D_NOPE / 32, KS_R = D_ROT / 32;
     typename decltype(mma_s)::vtype_a v_kw;
 #pragma unroll
     for(int m = 0; m < MR; m++)
@@ -4209,264 +4716,325 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
                     v_kw[(m * KS + ks) * 8 + e] = v_kr[(m * KS_R + ks - KS_N) * 8 + e];
             }
 
-    // Q and dO tiles go global -> LDS directly (gated_mla_bwd::dma16), one tile ahead, so they take
-    // no staging registers. Each such load writes 64 lanes x 16 B contiguously from a wave-uniform
-    // LDS address, so load j of a tensor covers 16-byte slots 64 j .. + 63 of its tile laid out
-    // with the row padding: slot s of Q is row s / 26, chunk s % 26 (chunks 24, 25 are padding),
-    // of dO row s / 18, chunk s % 18 (16, 17 padding). Padding slots and rows past seqlen_q read
-    // out of bounds, as 0. Of a tile's 13 Q and 9 dO loads, wave w issues Q loads w, w + 4, w + 8
-    // and dO loads w, w + 4; wave 0 also Q load 12, wave 1 dO load 8.
-    constexpr int QS = LD_Q * 2 / 16, DS = LD_DO * 2 / 16;  // slots per padded row
-    static_assert(BQ * QS == 13 * 64 && BQ * DS == 9 * 64, "the load split below");
-    constexpr int OOB = 1 << 30;                            // byte offset past any tile
-    auto slot_os = [&](int j, int slots, int chunks, int row_bytes) {
-        const int sl = 64 * j + lane, c = sl % slots;
-        return c < chunks ? sl / slots * row_bytes + c * 16 : OOB;
-    };
-    int os_q[4], os_d[3];
-#pragma unroll
-    for(int u = 0; u < 3; u++)
-        os_q[u] = slot_os(w + 4 * u, QS, D_QK / 8, k.stride_q_n * 2);
-    os_q[3] = slot_os(12, QS, D_QK / 8, k.stride_q_n * 2);
-#pragma unroll
-    for(int u = 0; u < 2; u++)
-        os_d[u] = slot_os(w + 4 * u, DS, D_V / 8, k.stride_do_n * 2);
-    os_d[2] = slot_os(8, DS, D_V / 8, k.stride_do_n * 2);
-    const bf16_t* q_ptr  = reinterpret_cast<const bf16_t*>(k.ptr_q) + static_cast<long long>(q0) * k.stride_q_n +
-                          static_cast<long long>(h) * k.stride_q_h;
-    const bf16_t* do_ptr = reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(q0) * k.stride_do_n +
-                           static_cast<long long>(h) * k.stride_do_h;
-    auto dma = [&](int i, int buf) {
-        const int qt0 = i * BQ;
-        const auto rq = gated_mla_bwd::dma_rsrc(q_ptr + static_cast<long long>(qt0) * k.stride_q_n,
-                                                rec_rows(seqlen_q - qt0, BQ, k.stride_q_n * 2));
-        const auto rd = gated_mla_bwd::dma_rsrc(do_ptr + static_cast<long long>(qt0) * k.stride_do_n,
-                                                rec_rows(seqlen_q - qt0, BQ, k.stride_do_n * 2));
-        const unsigned int lq = gated_mla_bwd::lds_addr(smem + OFF_Q + buf * BQ * LD_Q);
-        const unsigned int ld = gated_mla_bwd::lds_addr(smem + OFF_DO + buf * BQ * LD_DO);
-#pragma unroll
-        for(int u = 0; u < 3; u++)
-            gated_mla_bwd::dma16(rq, os_q[u], lq + (w + 4 * u) * 1024);
-#pragma unroll
-        for(int u = 0; u < 2; u++)
-            gated_mla_bwd::dma16(rd, os_d[u], ld + (w + 4 * u) * 1024);
-        if(w == 0)
-            gated_mla_bwd::dma16(rq, os_q[3], lq + 12 * 1024);
-        if(w == 1)
-            gated_mla_bwd::dma16(rd, os_d[2], ld + 8 * 1024);
-    };
-    const bool f_ld     = w < 2 && lane < BQ;
-    const int ld_slot   = (w == 0 ? 0 : BQ) + lane;
-    const float* ld_ptr = (w == 0 ? k.ptr_lse : k.ptr_d) + static_cast<long long>(h) * k.stride_lse_h + q0;
-    float r_ld = 0.0f;
-    auto fetch_ld = [&](int i) {
-        if(f_ld)
-            r_ld = opus::make_gmem(ld_ptr + i * BQ, rec_rows(seqlen_q - i * BQ, BQ, 4)).template load<1>(lane)[0];
-    };
-    auto stage_ld = [&](int buf) {
-        if(f_ld)
-            s_ld[buf][ld_slot] = r_ld;
-    };
-    // The DMA writes land in LDS when vmcnt says so, which s_barrier does not wait for.
-    auto dma_wait = [] { asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); };
-
-    auto s_q  = [&](int b) { return opus::make_smem(smem + OFF_Q + b * BQ * LD_Q); };
-    auto s_do = [&](int b) { return opus::make_smem(smem + OFF_DO + b * BQ * LD_DO); };
-    const auto u_q  = opus::partition_layout_b<8>(mma_s, opus::make_tuple(number<LD_Q>{}, 1_I), c_ab);
-    const auto u_do = opus::partition_layout_b<8>(mma_dp, opus::make_tuple(number<LD_DO>{}, 1_I), c_ab);
-    // C element e = (m NT + tn) 4 + p of S^T / dP^T is key 16 m + lane % 16 of the wave and
-    // query 16 tn + 4 (lane / 16) + p of the tile.
-    constexpr int NS = decltype(mma_s)::tile_c_len;
-    static_assert(NS == MR * NT * 4);
-    const int c_kv = row_w + lane % 16, c_q = 4 * (lane / 16);
-    const float scale_log2 = k.softmax_scale * LOG2_E;
-
-    // dK and dV accumulators, [M tile][N tile] in the swap_ab C layout, in AGPRs.
-    constexpr int NV = D_V / 16, NR = D_ROT / 16;
-    f32x4_t acc_dv[MR][NV], acc_dkn[MR][NV], acc_dkr[MR][NR];
+    // dV's accumulators, zeroed behind the loads of K and V (dK's come zeroed from the kernel).
+    f32x4_t acc_dv[MR][NV];
 #pragma unroll
     for(int m = 0; m < MR; m++)
-    {
 #pragma unroll
         for(int n = 0; n < NV; n++)
-            acc_dv[m][n] = acc_dkn[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-        for(int n = 0; n < NR; n++)
-            acc_dkr[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
-    }
-
-    // K and V must be in registers before the loop: otherwise the compiler waits for them inside
-    // it, with vmcnt counts that the DMA loads then make block. 0x0f70 is s_waitcnt vmcnt(0).
-    __builtin_amdgcn_s_waitcnt(0x0f70);
-    if(i_begin < n_q_tiles)
+        {
+            acc_dv[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+            asm volatile("" : "+a"(acc_dv[m][n]));
+        }
     {
-        dma(i_begin, 0);
-        fetch_ld(i_begin);
-        stage_ld(0);
-        if(i_begin + 1 < n_q_tiles)
-            fetch_ld(i_begin + 1);
-    }
-    dma_wait();
-    __syncthreads();
+        // Loop-carried scalars, at the top of the iteration of S^T tile ts: lbc, lbp the LDS
+        // address of tile ts - 1's buffer and of tile ts - 2's (the DMA's target, tile ts + 2
+        // goes there); dlt the LDS addresses' step from tile ts - 1's buffer to tile ts's (from
+        // tile ts's to the next past S^T unit 24); rc tile ts's buffer in the ring (0 .. 3), dn
+        // the step from it to the next (-3 buffers past the last, without flags: single scalars
+        // go anywhere); ra = seqlen_q - (ts + 4) BQ (negative: tile ts + 3 is not a full one),
+        // fd = ts - if0 (negative: mask), z = ts - T.
+        constexpr int SZB = XB_SZ * 2;
+        static_assert(XNB == 4, "the ring's wrap below");
+        int rc = 0, dn = 0;
+        int dlt = -(XNB - 1) * SZB;
+        unsigned int lbc = lds_of((XNB - 1) * XB_SZ), lbp = lds_of((XNB - 2) * XB_SZ);
+        int ra = seqlen_q - (i0 + 4) * BQ, fd = i0 - if0, z = i0 - T;
+        asm volatile("" : "+s"(rc), "+s"(dlt), "+s"(lbc), "+s"(lbp));
+        asm volatile("" : "+s"(ra), "+s"(fd), "+s"(z));
 
-    // One tile per iteration: issue the next tile's DMA, compute, wait for the DMA, barrier. The
-    // tiles this wave sees in full (no mask: every query valid, at or past its last key) form one
-    // contiguous range [i_full0, i_full1) and run the interleaved code; the masked ones before and
-    // after it run the plain code. Every wave passes one barrier per tile either way.
-    auto iter = [&](int i, auto full_c) {
-        const int b   = (i - i_begin) & 1;
-        const int qt0 = i * BQ;
-        // The other buffer held tile i - 1, read before the last barrier. LSE / D of tile i + 1
-        // are stored and those of tile i + 2 loaded before the DMA is issued: the compiler waits
-        // for its own loads with vmcnt(0), which would otherwise also wait for the DMA.
-        if(i + 1 < n_q_tiles)
-            stage_ld(b ^ 1);
-        if(i + 2 < n_q_tiles)
-            fetch_ld(i + 2);
-        if(i + 1 < n_q_tiles)
-            dma(i + 1, b ^ 1);
-        // With one wave per SIMD, VALU work overlaps MFMAs only where it sits between them in
-        // issue order (the wave stalls on an MFMA while the pipe is busy). The tile runs as four
-        // blocks fenced by sched_barrier(0): S^T; dP^T one MFMA at a time with the exp of one P
-        // element after each (S^T is complete); dV likewise with one dS element after each (dP^T
-        // is complete); dK. Inside a block, sched_barrier(SB_MEM_SALU) keeps that MFMA / VALU
-        // order and lets LDS, VMEM and SALU work move; the fences keep each block's LDS reads
-        // from all being hoisted to the top of the tile, which would exceed the VGPRs. Only tiles
-        // that need no mask run this way.
-        constexpr int SB_MEM_SALU = 0x4 | 0x10 | 0x80;  // SALU, all VMEM, all DS may cross
-        constexpr int KSV         = D_V / 32;
-        static_assert(KSV * MR * NT == NS && MR * NV == NS, "one P / dS element per MFMA");
-        auto tile_full = [&] {
-            f32x4_t lse4[NT];
+        namespace sch = gated_mla_bwd_4ws;
+        // A unit's VALU and read from its row of the schedule. The rows are read in constant
+        // expressions and passed by value (the tables are globals of the device module
+        // otherwise, whose loads do not fold).
+        auto v_run = [&](sch::vop o0, sch::vop o1, sch::vop o2) __attribute__((always_inline)) {
+            const sch::vop os[3] = {o0, o1, o2};
 #pragma unroll
-            for(int tn = 0; tn < NT; tn++)
+            for(int i = 0; i < 3; i++)
             {
-                lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
-#pragma unroll
-                for(int p = 0; p < 4; p++)
-                    lse4[tn][p] *= LOG2_E;
+                const int kd = os[i].k, e = os[i].e;
+                if(kd == sch::V_LSE)
+                    lse1(e);
+                if(kd == sch::V_FMA)
+                    fma1(e);
+                if(kd == sch::V_EXP)
+                    expa(e);
+                if(kd == sch::V_SUB)
+                    sub1(e);
+                if(kd == sch::V_NEG)
+                    neg1(e);
+                if(kd == sch::V_MUL)
+                    mul1(e);
+                if(kd == sch::V_PP)
+                    pack(v_sp, a_p, e);
+                if(kd == sch::V_PD)
+                    pack(v_dp, a_ds, e);
+                if(kd == sch::V_AQ)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_q) : "s"(dlt));
+                if(kd == sch::V_ATQ)
+                    asm volatile("v_add_u32 %0, %1, %2" : "=v"(a_tq) : "v"(a_q), "v"(c_tq));
+                if(kd == sch::V_ADO)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_do) : "s"(dlt));
+                if(kd == sch::V_ATDO)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_tdo) : "s"(dlt));
+                if(kd == sch::V_ALD)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_ld) : "s"(dlt));
             }
-            auto v_sp       = mma_s(v_kw, s_q(b).template load<8>(u_q));
-            const auto b_dp = s_do(b).template load<8>(u_do);
-            __builtin_amdgcn_sched_barrier(0);
+        };
+        auto r_run = [&](sch::rop r) __attribute__((always_inline)) {
+            if(r.k == sch::R_Q)
+                bq[r.a % 3] = rd_q(r.a / KS, r.a % KS);
+            if(r.k == sch::R_O)
+                bdo[r.a % 3] = rd_do(r.a / KSV, r.a % KSV);
+            if(r.k == sch::R_TQ)
+                tb[r.a % 3][r.b] = rd_tq(r.a, r.b);
+            if(r.k == sch::R_TO)
+                tb[r.a % 3][r.b] = rd_to(r.a, r.b);
+            if(r.k == sch::R_LS)
+                lse4[r.a] = at_f(a_ld).template load<4>(16 * r.a);
+            if(r.k == sch::R_DD)
+                d4[r.a] = at_f(a_ld).template load<4>(64 + 16 * r.a);
+        };
 
-            opus::vector_t<float, NS> v_dpt;
-#pragma unroll
-            for(int ks = 0; ks < KSV; ks++)
+        // S^T of tile ts, 36 units: fragment f = u / 3 (N tile f / 6, K step f % 6) for M tile
+        // u % 3. It follows the barrier, behind which VALU stands still for some 100 cycles while
+        // MFMA, LDS reads, DMA and scalars run on: its first 7 units carry reads, two DMA rounds
+        // and scalar pairs (the DMA descriptors' 64-bit steps). Single scalars: one to a unit
+        // that has no wait. Returns a negative number if the sizes of tile ts + 3 are to be set
+        // or S^T is to be masked (rare_fix).
+        auto s_block = [&]() __attribute__((always_inline)) {
+            int rare = 0;
+            opus::static_for<NT * KS * MR>([&](auto U) {
+                constexpr int u = decltype(U)::value, f = u / MR, j = u % MR, tn = f / KS, ks = f % KS;
+                constexpr sch::vop o0 = sch::S_V[u][0], o1 = sch::S_V[u][1], o2 = sch::S_V[u][2];
+                constexpr sch::rop rs = sch::S_R[u];
+                constexpr int xr = sch::S_X[u];
+                mm(v_kw, j * KS + ks, bq[f % 3], v_sp, j * NT + tn, ks == 0 ? 0 : (ks == KS - 1 ? 2 : 1));
+                if(u % 3 == 2 && u <= 32)
+                    touch(bq[(u + 1) / 3 % 3]);
+                if(u == 34)
+                    touch(bdo[0]);
+                // The DMA's descriptors a tile on: 1 .. 3 in front of their rounds, 0 past its.
+                if(u == 0)
+                    x_adv(1);
+                if(u == 3)
+                    x_adv(2);
+                if(u == 6)
+                    x_adv(3);
+                if(u == 33)
+                    x_adv(0);
+                // The ring a buffer on: rc = (rc + 1) & 3, dn = rc == 0 ? -3 buffers : 1 buffer.
+                if(u == 2)
+                    asm volatile("s_add_i32 %0, %0, 1" : "+s"(rc) : : "scc");
+                if(u == 5)
+                    asm volatile("s_and_b32 %0, %0, 3" : "+s"(rc) : : "scc");
+                if(u == 9)
+                    asm volatile("s_sub_i32 %0, %1, 1" : "=s"(dn) : "s"(rc) : "scc");
+                if(u == 12)
+                    asm volatile("s_ashr_i32 %0, %0, 31" : "+s"(dn) : : "scc");
+                if(u == 15)
+                    asm volatile("s_and_b32 %0, %0, %1" : "+s"(dn) : "n"(-XNB * SZB) : "scc");
+                if(u == 18)
+                    asm volatile("s_add_i32 %0, %0, %1" : "+s"(dn) : "n"(SZB) : "scc");
+                // Past the last round: the DMA's target and the address step a tile on.
+                if(u == 21)
+                    asm volatile("s_mov_b32 %0, %1" : "=s"(lbp) : "s"(lbc));
+                if(u == 22)
+                    asm volatile("s_add_u32 %0, %0, %1" : "+s"(lbc) : "s"(dlt) : "scc");
+                if(u == 24)
+                    asm volatile("s_mov_b32 %0, %1" : "=s"(dlt) : "s"(dn));
+                // The counters on; the rare cases' sign from the S^T tile's ra and fd first.
+                if(u == 25)
+                    asm volatile("s_add_i32 %0, %0, 1" : "+s"(z) : : "scc");
+                if(u == 27)
+                    asm volatile("s_or_b32 %0, %1, %2" : "=s"(rare) : "s"(ra), "s"(fd) : "scc");
+                if(u == 30)
+                    asm volatile("s_sub_i32 %0, %0, %1" : "+s"(ra) : "n"(BQ) : "scc");
+                if(u == 31)
+                    asm volatile("s_add_i32 %0, %0, 1" : "+s"(fd) : : "scc");
+                r_run(rs);
+                if(xr >= 0)
+                    x_go(xr >= 0 ? xr : 0, lbp);
+                v_run(o0, o1, o2);
+                if(ks == KS - 1 || u == 18)
+                    touch(c_old);
+                fence();
+            });
+            return rare;
+        };
+        // The rare cases: tile ts + 3 is not a full one (its sizes), this wave's keys do not all
+        // see tile ts under the causal mask: the elements masked take P = 0 where the exp is made
+        // already, else an S^T (or S^T scale - LSE) that exps to 0.
+        auto rare_fix = [&](int ts) {
+            if(seqlen_q - (ts + 4) * BQ < 0)
+                x_sizes(ts + 3);
+            if(ts < if0)
+            {
+                // Element e is key row_w + 16 (e / 8) + lane % 16 and query BQ ts + 16 (e / 4 % 2)
+                // + 4 (lane / 16) + e % 4, seen if query + causal_offset >= key: xm[M tile] is
+                // the first query of the tile the lane's key sees, less the lane's 4 (lane / 16).
+                int xm[MR];
 #pragma unroll
                 for(int m = 0; m < MR; m++)
-#pragma unroll
-                    for(int tn = 0; tn < NT; tn++)
-                    {
-                        const int t = m * NT + tn;
-                        f32x4_t c;
-#pragma unroll
-                        for(int p = 0; p < 4; p++)
-                            c[p] = ks == 0 ? 0.0f : v_dpt[t * 4 + p];
-                        bvec<8> fa, fb;
-#pragma unroll
-                        for(int x = 0; x < 8; x++)
-                        {
-                            fa[x] = v_vw[(m * KSV + ks) * 8 + x];
-                            fb[x] = b_dp[(tn * KSV + ks) * 8 + x];
-                        }
-                        c = mma1(fa, fb, c);
-#pragma unroll
-                        for(int p = 0; p < 4; p++)
-                            v_dpt[t * 4 + p] = c[p];
-                        const int e   = (ks * MR + m) * NT + tn;
-                        const float x = v_sp[e] * scale_log2 - lse4[e / 4 % NT][e % 4];
-                        v_sp[e]       = __builtin_amdgcn_exp2f(x);
-                        __builtin_amdgcn_sched_barrier(SB_MEM_SALU);
-                    }
-            // C -> A: an M tile's 8 elements (both N tiles) are in the K order of tr_load_b_c_order.
-            const auto a_p = opus::cast<bf16_t>(v_sp);
-            __builtin_amdgcn_sched_barrier(0);
-
-            f32x4_t d4[NT];
-#pragma unroll
-            for(int tn = 0; tn < NT; tn++)
-                d4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
-            const auto b_dv = tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0);
-#pragma unroll
-            for(int m = 0; m < MR; m++)
-#pragma unroll
-                for(int n = 0; n < NV; n++)
-                {
-                    gated_mla_bwd::mfma_acc_16x16x32(acc_dv[m][n], gated_mla_bwd::frag8(a_p, m), gated_mla_bwd::frag8(b_dv, n));
-                    const int e = m * NV + n;
-                    v_sp[e]     = v_sp[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
-                    __builtin_amdgcn_sched_barrier(SB_MEM_SALU);
-                }
-            const auto a_ds = opus::cast<bf16_t>(v_sp);
-            __builtin_amdgcn_sched_barrier(0);
-
-            acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
-            acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
-        };
-        // Tiles that need the mask (few: the diagonal and sequence ends) take the plain order.
-        auto tile_masked = [&] {
-            f32x4_t lse4[NT], d4[NT];
-#pragma unroll
-            for(int tn = 0; tn < NT; tn++)
-            {
-                lse4[tn] = *reinterpret_cast<const f32x4_t*>(&s_ld[b][16 * tn + c_q]);
-                d4[tn]   = *reinterpret_cast<const f32x4_t*>(&s_ld[b][BQ + 16 * tn + c_q]);
-#pragma unroll
-                for(int p = 0; p < 4; p++)
-                    lse4[tn][p] *= LOG2_E;
+                    xm[m] = c_kv + 16 * m - causal_offset - ts * BQ - c_q;
+                // The mask, four elements (one C tile) at a time: four compares into scalar pairs, then
+                // the four selects. A select then stands three instructions behind its compare; left
+                // to the compiler, each pair takes two s_nop between them (a rare iteration was 400
+                // cycles of masking).
+                float m_z = 0.0f, m_n = -1e30f;
+                pin(m_z);
+                pin(m_n);
+                opus::static_for<NS / 4>([&](auto G) {
+                    constexpr int gt = decltype(G)::value, c0 = 16 * (gt % NT), e0 = 4 * gt;
+                    float x0 = v_sp[e0], x1 = v_sp[e0 + 1], x2 = v_sp[e0 + 2], x3 = v_sp[e0 + 3];
+                    unsigned long long t0, t1, t2, t3;
+                    asm volatile("v_cmp_le_i32 %4, %8, %13\n\tv_cmp_le_i32 %5, %8, %14\n\tv_cmp_le_i32 %6, %8, %15\n\tv_cmp_le_i32 %7, %8, %16\n\t"
+                                 "v_cndmask_b32 %0, %9, %0, %4\n\tv_cndmask_b32 %1, %10, %1, %5\n\tv_cndmask_b32 %2, %11, %2, %6\n\tv_cndmask_b32 %3, %12, %3, %7"
+                                 : "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3), "=&s"(t0), "=&s"(t1), "=&s"(t2), "=&s"(t3)
+                                 : "v"(xm[gt / NT]), "v"((sch::S_EXPD >> e0 & 1) ? m_z : m_n), "v"((sch::S_EXPD >> (e0 + 1) & 1) ? m_z : m_n),
+                                   "v"((sch::S_EXPD >> (e0 + 2) & 1) ? m_z : m_n), "v"((sch::S_EXPD >> (e0 + 3) & 1) ? m_z : m_n),
+                                   "n"(c0), "n"(c0 + 1), "n"(c0 + 2), "n"(c0 + 3));
+                    v_sp[e0]     = x0;
+                    v_sp[e0 + 1] = x1;
+                    v_sp[e0 + 2] = x2;
+                    v_sp[e0 + 3] = x3;
+                });
             }
-            const auto v_st = mma_s(v_kw, s_q(b).template load<8>(u_q));
-            opus::vector_t<float, NS> v_p;
-#pragma unroll
-            for(int e = 0; e < NS; e++)
-            {
-                const int kv = c_kv + 16 * (e / (4 * NT)), qp = qt0 + c_q + 16 * (e / 4 % NT) + e % 4;
-                const bool ok = (kv < seqlen_k) & (qp < seqlen_q) & (!k.causal | (qp + causal_offset >= kv));
-                const float x = v_st[e] * scale_log2 - lse4[e / 4 % NT][e % 4];
-                v_p[e]        = __builtin_amdgcn_exp2f(ok ? x : -1e30f);
-            }
-            const auto v_dpt = mma_dp(v_vw, s_do(b).template load<8>(u_do));
-            opus::vector_t<float, NS> v_ds;
-#pragma unroll
-            for(int e = 0; e < NS; e++)
-                v_ds[e] = v_p[e] * (v_dpt[e] - d4[e / 4 % NT][e % 4]) * k.softmax_scale;
-            const auto a_p  = opus::cast<bf16_t>(v_p);
-            const auto a_ds = opus::cast<bf16_t>(v_ds);
-            acc_gemm32(acc_dv, a_p, tr_load_b_c_order<NV, LD_DO>(s_do(b), lane, 0));
-            acc_gemm32(acc_dkn, a_ds, tr_load_b_c_order<NV, LD_Q>(s_q(b), lane, 0));
-            acc_gemm32(acc_dkr, a_ds, tr_load_b_c_order<NR, LD_Q>(s_q(b), lane, D_NOPE));
+        };
+        // dP^T(ts), 24 units: fragment f = u / 3 (N tile f / 4, K step f % 4) for M tile u % 3.
+        auto dp_block = [&]() __attribute__((always_inline)) {
+            opus::static_for<NT * KSV * MR>([&](auto U) {
+                constexpr int u = decltype(U)::value, f = u / MR, j = u % MR, tn = f / KSV, ks = f % KSV;
+                constexpr sch::vop o0 = sch::P_V[u][0], o1 = sch::P_V[u][1], o2 = sch::P_V[u][2];
+                constexpr sch::rop rs = sch::P_R[u];
+                mm(v_vw, j * KSV + ks, bdo[f % 3], v_dp, j * NT + tn, ks == 0 ? 0 : (ks == KSV - 1 ? 2 : 1),
+                   GMLA_DP_MINUS_D && ks == 0 ? &d4[tn] : nullptr);
+                if(u % 3 == 2 && u <= 20)
+                    touch(bdo[(u + 1) / 3 % 3]);
+                if(u == 23)
+                    touch2(tb[0][0], tb[0][1]);
+                r_run(rs);
+                v_run(o0, o1, o2);
+                if(ks == KSV - 1 || u == 0 || u == 12)
+                    touch(c_old);
+                fence();
+            });
+        };
+        // dK of the tile before (of the last tile in the tail), 36 units of 3 per N tile; the
+        // first two of an N tile read Q^T two N tiles ahead (the last two N tiles' dO^T's first
+        // two, for the dV that follows).
+        auto dk_block = [&](bool tail) __attribute__((always_inline)) {
+            opus::static_for<NG * MR>([&](auto U) {
+                constexpr int q = decltype(U)::value, gn = q / MR, m = q % MR;
+                constexpr sch::vop o0 = sch::K_V[q][0], o1 = sch::K_V[q][1], o2 = sch::K_V[q][2];
+                if(gn < NV)
+                    acc1(acc_dkn[m][gn < NV ? gn : 0], gated_mla_bwd::frag8(a_ds, m), b_tr(tb[gn % 3]));
+                else
+                    acc1(acc_dkr[m][gn >= NV ? gn - NV : 0], gated_mla_bwd::frag8(a_ds, m), b_tr(tb[gn % 3]));
+                if(m == 2 && gn + 1 < NG)
+                    touch2(tb[(gn + 1) % 3][0], tb[(gn + 1) % 3][1]);
+                if(!tail && m == 2 && gn == NG - 1)
+                    touch2(tb[0][0], tb[0][1]);
+                if(m < 2 && gn + 2 < NG)
+                    tb[(gn + 2) % 3][m] = rd_tq(gn + 2, m);
+                if(!tail && m < 2 && gn + 2 >= NG)
+                    tb[(gn + 2 - NG) % 3][m] = rd_to(gn + 2 - NG, m);
+                if(!tail)
+                    v_run(o0, o1, o2);
+                if(!tail && q == 0)
+                    touch(c_old);
+                fence();
+            });
+        };
+        // dV(ts), 24 units of 3 per N tile; the first two of an N tile read dO^T two N tiles
+        // ahead (N tile 6's the next S^T's first two fragments). The waits before the barrier:
+        // this wave's DMA loads, issued in this iteration's S^T block, are in.
+        auto dv_block = [&]() __attribute__((always_inline)) {
+            opus::static_for<NV * MR>([&](auto U) {
+                constexpr int v = decltype(U)::value, gn = v / MR, m = v % MR;
+                constexpr sch::vop o0 = sch::V_V[v][0], o1 = sch::V_V[v][1], o2 = sch::V_V[v][2];
+                acc1(acc_dv[m][gn], gated_mla_bwd::frag8(a_p, m), b_tr(tb[gn % 3]));
+                if(m == 2 && gn + 1 < NV)
+                    touch2(tb[(gn + 1) % 3][0], tb[(gn + 1) % 3][1]);
+                if(v == 19)
+                    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                if(v == NV * MR - 1)
+                    touch(bq[0]);
+                if(m < 2 && gn + 2 < NV)
+                    tb[(gn + 2) % 3][m] = rd_to(gn + 2, m);
+                if(m < 2 && gn == NV - 2)
+                    bq[m] = rd_q(0, m);  // the next S^T's first two fragments
+                // D of the next tile's N tile vdd (GMLA_DP_MINUS_D): LSE's and D's address is on it.
+                constexpr int vdd = sch::V_DD[v];
+                if(vdd >= 0)
+                    d4[vdd >= 0 ? vdd : 0] = at_f(a_ld).template load<4>(64 + 16 * vdd);
+                v_run(o0, o1, o2);
+                fence();
+            });
         };
 
-        if constexpr(decltype(full_c)::value)
-        tile_full();
-        else
-        tile_masked();
-        dma_wait();
-        __syncthreads();
-    };
-    int i_full0 = n_q_tiles, i_full1 = n_q_tiles;
-    if(row_w + WR <= seqlen_k)
-    {
-        // causal: qt0 + causal_offset >= row_w + WR - 1; all: qt0 + BQ <= seqlen_q
-        const int need = row_w + WR - 1 - causal_offset;
-        i_full0 = k.causal && need > 0 ? (need + BQ - 1) / BQ : 0;
-        i_full1 = seqlen_q / BQ;
-        i_full0 = i_full0 < i_begin ? i_begin : (i_full0 > n_q_tiles ? n_q_tiles : i_full0);
-        i_full1 = i_full1 < i_full0 ? i_full0 : (i_full1 > n_q_tiles ? n_q_tiles : i_full1);
+        // K and V are in registers and this wave's loads of the first two tiles in LDS (0x0f70 is
+        // s_waitcnt vmcnt(0), as an instruction the compiler sees: it then waits for none of them
+        // inside the loop); every wave's are behind the barrier.
+        __builtin_amdgcn_s_waitcnt(0x0f70);
+        barrier();
+        bq[0] = rd_q(0, 0);
+        bq[1] = rd_q(0, 1);
+        touch(bq[0]);
+#if GMLA_DP_MINUS_D
+        // -D of the first tile's queries, where its dP^T's accumulators start; the loop reads each
+        // next tile's D in its dV block.
+#pragma unroll
+        for(int tn = 0; tn < NT; tn++)
+            d4[tn] = at_f(a_ld).template load<4>(64 + 16 * tn);
+#pragma unroll
+        for(int x = 0; x < 4 * NT; x++)
+            neg1(x);
+#endif
+        // The loop starts on a 64-byte boundary: where its code lies decides whether the branch
+        // of the rare cases (not taken) costs 4 cycles or 20.
+        asm volatile(".p2align 6");
+        do
+        {
+            // Every wave is past dK's reads of tile ts - 2, whose buffer this S^T block's DMA
+            // overwrites, and has its loads of tile ts + 1 in.
+            barrier();
+            const int rare = s_block();
+            if(__builtin_expect(rare < 0, 0))
+                rare_fix(z - 1 + T);
+            dp_block();
+            dk_block(false);
+            dv_block();
+        } while(__builtin_expect(z < 0, 1));
+        // The last tile's dK: its dS to bf16, its first two N tiles' fragments of Q^T (whose
+        // address the last iteration left on it).
+#pragma unroll
+        for(int jp = 0; jp < NS / 2; jp++)
+            pack(v_dp, a_ds, jp);
+#pragma unroll
+        for(int x = 0; x < 4; x++)
+            tb[x / 2][x % 2] = rd_tq(x / 2, x % 2);
+        dk_block(true);
     }
-    int i = i_begin;
-    for(; i < i_full0; i++)
-        iter(i, std::false_type{});
-    for(; i < i_full1; i++)
-        iter(i, std::true_type{});
-    for(; i < n_q_tiles; i++)
-        iter(i, std::false_type{});
+    // The loads still out go to LDS, which the epilogue uses.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 
     // dK nope and dV into the kv_b_proj layout, dK rope per head in fp32. The C fragments hold
     // 4 columns of 16 rows per instruction, so each wave transposes its 48 rows through LDS first
     // and stores whole rows; rows past seqlen_k fall outside the descriptors and are dropped.
     mfma_acc_drain();
+    // The accumulators are read from here on: the compiler does not know the asm MFMAs' latency
+    // and would read one right behind the MFMA that writes it.
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+    {
+#pragma unroll
+        for(int n = 0; n < NV; n++)
+            asm volatile("" : "+a"(acc_dv[m][n]), "+a"(acc_dkn[m][n]));
+#pragma unroll
+        for(int n = 0; n < NR; n++)
+            asm volatile("" : "+a"(acc_dkr[m][n]));
+    }
     __syncthreads();
     {
         constexpr int LD_R = D_ROT + 4;  // [48][dK rope] fp32, over the same LDS
@@ -4481,7 +5049,7 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
             for(int n = 0; n < NV; n++)
             {
                 bf16_t* o = s_o + (16 * m + c_row) * LD_O + 16 * n + c_col;
-                *reinterpret_cast<bvec<4>*>(o)          = opus::cast<bf16_t>(acc_dkn[m][n]);
+                *reinterpret_cast<bvec<4>*>(o)          = opus::cast<bf16_t>(acc_dkn[m][n] * k.softmax_scale);
                 *reinterpret_cast<bvec<4>*>(o + D_NOPE) = opus::cast<bf16_t>(acc_dv[m][n]);
             }
         bf16_t* dkv = reinterpret_cast<bf16_t*>(k.ptr_dkv) + static_cast<long long>(k0 + row_w) * k.stride_dkv_n +
@@ -4499,7 +5067,7 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
         for(int m = 0; m < MR; m++)
 #pragma unroll
             for(int n = 0; n < NR; n++)
-                *reinterpret_cast<f32x4_t*>(s_r + (16 * m + c_row) * LD_R + 16 * n + c_col) = acc_dkr[m][n];
+                *reinterpret_cast<f32x4_t*>(s_r + (16 * m + c_row) * LD_R + 16 * n + c_col) = acc_dkr[m][n] * k.softmax_scale;
         auto g_dkr = opus::make_gmem(k.ptr_dk_rope + static_cast<long long>(k0 + row_w) * k.stride_dkr_n +
                                          static_cast<long long>(h) * k.stride_dkr_h,
                                      rec(static_cast<long long>(rows_w) * k.stride_dkr_n, 4));
@@ -4512,6 +5080,922 @@ __global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_dkdv
             g_dkr.template store<4>(*reinterpret_cast<const f32x4_t*>(s_r + row * LD_R + col), row * k.stride_dkr_n + col);
         }
     }
+    }
+}
+
+// The 4-wave dQ kernel's schedule: what goes behind the MFMA of each unit of its three blocks (S 36 units,
+// dP 24, dQ 36). Element e of a tile's 24 S / dP values per lane is C tile (M tile e / 8, N tile e / 4 % 2).
+//   V_PACK j   elements 2 j, 2 j + 1 of dS of the tile before to bf16 (the A operand of the dQ block)
+//   V_FMA e    S scale - LSE        V_EXP e   its exp, P (fills a unit)
+//   V_SUB e    dP - D               V_MUL e   P (dP - D), dS in fp32 (GMLA_DP_MINUS_D: dP starts at -D, no V_SUB)
+//   V_AKN, V_AKR, V_AV   K nope's, K rope's, V's LDS address a tile on; V_ATKN, V_ATKR  K^T's from V's
+//   R_K f, R_V f   S's / dP's B fragment f (N tile, K step in N-tile-major order); R_T g, h   K^T's N tile g, half h
+//   S_X        the DMA round of an S unit, or -1
+// A unit has room for two of VALU and read behind its MFMA (an exp is two, a DMA round both); the S block's
+// first 7 units take no VALU (it stands still behind the barrier). The dQ block's own reads are regular and
+// not in a table. S_EXPD: bit e set if element e's exp is in the S block (the mask of a tile not seen in full
+// is applied after it: those take P = 0, the others an S that exps to 0). The kernel reads the tables in
+// constant expressions only.
+namespace gated_mla_bwd_dq4s {
+enum : signed char { V_NONE, V_PACK, V_FMA, V_EXP, V_SUB, V_MUL, V_AKN, V_AKR, V_AV, V_ATKN, V_ATKR };
+enum : signed char { R_NONE, R_K, R_V, R_T };
+struct vop
+{
+    signed char k, e;
+};
+struct rop
+{
+    signed char k, a, b;
+};
+#if GMLA_DP_MINUS_D
+inline constexpr vop S_V[36][3] = {
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 0}, {V_PACK, 1}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 2}, {V_PACK, 3}, {V_NONE, 0}},
+    {{V_PACK, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 5}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PACK, 6}, {V_PACK, 7}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 8}, {V_PACK, 9}, {V_NONE, 0}},
+    {{V_FMA, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 8}, {V_FMA, 9}, {V_NONE, 0}}, {{V_EXP, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 3}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 18}, {V_FMA, 19}, {V_NONE, 0}},
+    {{V_EXP, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop S_R[36] = {
+    {R_K, 2, 0}, {R_NONE, 0, 0}, {R_T, 0, 0}, {R_K, 3, 0}, {R_NONE, 0, 0}, {R_T, 0, 1},
+    {R_K, 4, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_K, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 6, 0}, {R_NONE, 0, 0}, {R_K, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 8, 0}, {R_T, 1, 0}, {R_T, 1, 1}, {R_K, 9, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 10, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_K, 11, 0}, {R_V, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 1, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr signed char S_X[36] = {-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+inline constexpr vop P_V[24][3] = {
+    {{V_PACK, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 4}, {V_FMA, 5}, {V_NONE, 0}}, {{V_FMA, 6}, {V_FMA, 7}, {V_NONE, 0}},
+    {{V_FMA, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 13}, {V_FMA, 14}, {V_NONE, 0}}, {{V_FMA, 15}, {V_FMA, 20}, {V_NONE, 0}},
+    {{V_FMA, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 22}, {V_FMA, 23}, {V_NONE, 0}}, {{V_AKN, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 17}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PACK, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 0}, {V_MUL, 1}, {V_NONE, 0}}, {{V_MUL, 2}, {V_MUL, 3}, {V_NONE, 0}},
+    {{V_MUL, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 9}, {V_MUL, 10}, {V_NONE, 0}}, {{V_MUL, 11}, {V_MUL, 16}, {V_NONE, 0}},
+    {{V_MUL, 17}, {V_AKR, 0}, {V_NONE, 0}}, {{V_EXP, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 19}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 6}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop P_R[24] = {
+    {R_V, 2, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_V, 3, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 4, 0}, {R_NONE, 0, 0}, {R_V, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 6, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_V, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop Q_V[36][3] = {
+    {{V_MUL, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 12}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 6}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 7}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 13}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 13}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 14}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 14}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 15}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 15}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 20}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 21}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 22}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 22}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 23}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_ATKN, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_ATKR, 0}, {V_AV, 0}, {V_NONE, 0}},
+};
+inline constexpr unsigned int S_EXPD = 0x00070f;
+#else
+inline constexpr vop S_V[36][3] = {
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 0}, {V_PACK, 1}, {V_NONE, 0}},
+    {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 2}, {V_PACK, 3}, {V_NONE, 0}},
+    {{V_PACK, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 5}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PACK, 6}, {V_PACK, 7}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_PACK, 8}, {V_PACK, 9}, {V_NONE, 0}},
+    {{V_FMA, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 8}, {V_FMA, 9}, {V_NONE, 0}}, {{V_EXP, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 2}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 3}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_FMA, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 18}, {V_FMA, 19}, {V_NONE, 0}},
+    {{V_EXP, 9}, {V_AKR, 0}, {V_NONE, 0}}, {{V_EXP, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_NONE, 0}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop S_R[36] = {
+    {R_K, 2, 0}, {R_NONE, 0, 0}, {R_T, 0, 0}, {R_K, 3, 0}, {R_NONE, 0, 0}, {R_T, 0, 1},
+    {R_K, 4, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_K, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 6, 0}, {R_NONE, 0, 0}, {R_K, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 8, 0}, {R_T, 1, 0}, {R_T, 1, 1}, {R_K, 9, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_K, 10, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_K, 11, 0}, {R_V, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 1, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr signed char S_X[36] = {-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+inline constexpr vop P_V[24][3] = {
+    {{V_PACK, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 4}, {V_FMA, 5}, {V_NONE, 0}}, {{V_FMA, 6}, {V_FMA, 7}, {V_NONE, 0}},
+    {{V_FMA, 12}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 13}, {V_FMA, 14}, {V_NONE, 0}}, {{V_FMA, 15}, {V_FMA, 20}, {V_NONE, 0}},
+    {{V_FMA, 21}, {V_NONE, 0}, {V_NONE, 0}}, {{V_FMA, 22}, {V_FMA, 23}, {V_NONE, 0}}, {{V_AKN, 0}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 17}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_PACK, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 0}, {V_SUB, 1}, {V_NONE, 0}}, {{V_SUB, 2}, {V_SUB, 3}, {V_NONE, 0}},
+    {{V_SUB, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_SUB, 9}, {V_SUB, 10}, {V_NONE, 0}}, {{V_SUB, 11}, {V_SUB, 16}, {V_NONE, 0}},
+    {{V_SUB, 17}, {V_SUB, 18}, {V_NONE, 0}}, {{V_SUB, 19}, {V_EXP, 18}, {V_NONE, 0}}, {{V_EXP, 19}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_EXP, 4}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 5}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 6}, {V_NONE, 0}, {V_NONE, 0}},
+};
+inline constexpr rop P_R[24] = {
+    {R_V, 2, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_V, 3, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 4, 0}, {R_NONE, 0, 0}, {R_V, 5, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_V, 6, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_V, 7, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+    {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0}, {R_NONE, 0, 0},
+};
+inline constexpr vop Q_V[36][3] = {
+    {{V_MUL, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 1}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 7}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 2}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 3}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 12}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 8}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 9}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 13}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 10}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 11}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 14}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 16}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 17}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 15}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 18}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 19}, {V_NONE, 0}, {V_NONE, 0}}, {{V_EXP, 20}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 4}, {V_SUB, 5}, {V_NONE, 0}}, {{V_SUB, 6}, {V_SUB, 7}, {V_NONE, 0}}, {{V_EXP, 21}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 12}, {V_SUB, 13}, {V_NONE, 0}}, {{V_SUB, 14}, {V_SUB, 15}, {V_NONE, 0}}, {{V_EXP, 22}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_SUB, 20}, {V_SUB, 21}, {V_NONE, 0}}, {{V_SUB, 22}, {V_SUB, 23}, {V_NONE, 0}}, {{V_EXP, 23}, {V_NONE, 0}, {V_NONE, 0}},
+    {{V_MUL, 4}, {V_MUL, 5}, {V_NONE, 0}}, {{V_MUL, 6}, {V_MUL, 7}, {V_NONE, 0}}, {{V_MUL, 12}, {V_MUL, 13}, {V_NONE, 0}},
+    {{V_MUL, 14}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 15}, {V_NONE, 0}, {V_NONE, 0}}, {{V_MUL, 20}, {V_MUL, 21}, {V_NONE, 0}},
+    {{V_MUL, 22}, {V_MUL, 23}, {V_NONE, 0}}, {{V_ATKN, 0}, {V_NONE, 0}, {V_NONE, 0}}, {{V_ATKR, 0}, {V_AV, 0}, {V_NONE, 0}},
+};
+inline constexpr unsigned int S_EXPD = 0x00070f;
+#endif
+}  // namespace gated_mla_bwd_dq4s
+
+// dQ pass of the 4-wave backward, one wave per SIMD, on the recipe of the dK / dV pass's loop: wave w
+// owns 48 queries; their Q and dO (A of S and dP) stay in VGPRs, LSE and D with them, dQ in AGPRs.
+// Per tile of 32 keys (K nope, K rope and V go global -> LDS by DMA into 4 buffers) an iteration is
+// 96 units of one MFMA and what fits behind it (a scalar or wait and two of LDS read or VALU):
+//   barrier             every wave is past its reads of tile ts - 2, tile ts + 1 is whole
+//   S(ts)      36 MFMA  the 6 DMA rounds of tile ts + 2 into tile ts - 2's buffer, K's fragments
+//                       two ahead, dS of tile ts - 1 to bf16, the loop's scalars, S scale - LSE
+//                       and the exp of elements whose C tiles are done mid block
+//   dP(ts)     24 MFMA  the other S scale - LSE, exps, dP - D of the C tiles done mid block
+//   dQ(ts - 1) 36 MFMA  K^T's fragments two N tiles ahead; the other exps and dP - D, and
+//                       dS = P (dP - D) in fp32
+// S and dP go N tile by N tile (a B fragment serves three consecutive MFMAs, one per M tile), so
+// half their C tiles are done mid block. dQ runs a tile behind so that the VALU work of dS has
+// dP's and dQ's MFMAs to go behind. dS = P (dP - D): dP's accumulators start at -D
+// (GMLA_DP_MINUS_D), or at 0 with D subtracted as the pair pass and the 8-wave dQ kernel do it,
+// bit for bit.
+__device__ __attribute__((always_inline)) inline void gated_mla_bwd_dq_4w_body(
+    const gated_mla_bwd_4w_kargs& k, gated_mla_bwd::bf16_t* smem, const int lane, const int w, const int h, const int blk,
+    unsigned long long bnd_q, unsigned long long bnd_k, gated_mla_bwd::f32x4_t (&z)[3][12])
+{
+    using namespace gated_mla_bwd_dq4;
+    using gated_mla_bwd::bf16_t;
+    using gated_mla_bwd::bvec;
+    using gated_mla_bwd::f32x4_t;
+    using opus::number;
+    using opus::operator""_I;
+    using u32x2_t = gated_mla_bwd::u32x2_t;
+    using u32x4_t = gated_mla_bwd::u32x4_t;
+    constexpr int MR = WQ / 16, NT = KC / 16;
+    constexpr int KS = D_QK / 32, KS_N = D_NOPE / 32, KSV = D_V / 32, NG = D_QK / 16, NGN = D_NOPE / 16;
+    // dQ, [M tile][N tile of 16 columns], in AGPRs: the kernel's zeros. The long query blocks go
+    // first.
+    static_assert(MR == 3 && NG == 12, "the kernel's zeroed tiles");
+    f32x4_t acc[MR][NG];
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+#pragma unroll
+        for(int n = 0; n < NG; n++)
+            acc[m][n] = z[m][n];
+    const int qb = k.n_q_blocks - 1 - blk;
+
+    // The tensors' bases at this head.
+    const bf16_t* q_h  = reinterpret_cast<const bf16_t*>(k.ptr_q) + static_cast<long long>(h) * k.stride_q_h;
+    const bf16_t* do_h = reinterpret_cast<const bf16_t*>(k.ptr_do) + static_cast<long long>(h) * k.stride_do_h;
+    const bf16_t* kn_h = reinterpret_cast<const bf16_t*>(k.ptr_k_nope) + static_cast<long long>(h) * k.stride_k_h;
+    const bf16_t* v_h  = reinterpret_cast<const bf16_t*>(k.ptr_v) + static_cast<long long>(h) * k.stride_v_h;
+    bf16_t* dq_h       = reinterpret_cast<bf16_t*>(k.ptr_dq) + static_cast<long long>(h) * k.stride_dq_h;
+    const float* lse_h = k.ptr_lse + static_cast<long long>(h) * k.stride_lse_h;
+    const float* d_h   = k.ptr_d + static_cast<long long>(h) * k.stride_lse_h;
+    asm volatile("" : "+s"(q_h), "+s"(do_h), "+s"(kn_h), "+s"(v_h), "+s"(dq_h), "+s"(lse_h), "+s"(d_h));
+
+    auto make_mma = [](auto e_m, auto e_n, auto e_k) {
+        return opus::make_tiled_mma<bf16_t, bf16_t, float>(
+            opus::seq<decltype(e_m)::value, decltype(e_n)::value, decltype(e_k)::value>{},
+            opus::seq<1, 1, 1>{},
+            opus::seq<16, 16, 32>{},
+            opus::mfma_adaptor_swap_ab{});
+    };
+    auto mma_s  = make_mma(number<MR>{}, number<NT>{}, number<KS>{});   // Q's A layout: [M tile][K step][8]
+    auto mma_dp = make_mma(number<MR>{}, number<NT>{}, number<KSV>{});  // dO's A layout
+    auto mma_k1 = make_mma(number<MR>{}, number<NT>{}, number<1>{});
+    auto mma1   = make_mma(number<1>{}, number<1>{}, number<1>{});
+    const auto c_ab = opus::make_tuple(0_I, lane % mma_k1.grpm_a, 0_I, lane / mma_k1.grpm_a);
+    constexpr int NS = decltype(mma_k1)::tile_c_len;
+    static_assert(NS == MR * NT * 4 && NS == 24 && MR * NG == 36 && NG % 3 == 0, "the units below");
+    auto rec = [](long long elems, int elem_bytes) -> unsigned int {
+        const long long b = elems > 0 ? elems * elem_bytes : 0;
+        return b >= 0xffffffffLL ? 0xffffffffu : static_cast<unsigned int>(b);
+    };
+    auto pin   = [](auto& x) { asm volatile("" : "+v"(x)); };
+    auto here  = [](auto& x) { asm volatile("" : "+s"(x)); };
+    auto fence = [] { __builtin_amdgcn_sched_barrier(0); };
+    auto touch  = [](const auto& x) { asm volatile("" : : "v"(x)); };
+    auto touch2 = [](const auto& x, const auto& y) { asm volatile("" : : "v"(x), "v"(y)); };
+    auto read_first = [] {
+        __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
+        __builtin_amdgcn_sched_group_barrier(0x002, 1, 0);
+    };
+    auto barrier = [&] {
+        fence();
+        __builtin_amdgcn_s_barrier();
+        fence();
+    };
+
+    float sc2 = k.softmax_scale * 1.44269504089f;  // the scale times log2 e, in a VGPR for the asm fma
+    pin(sc2);
+    auto lds_of = [&](int b) { return gated_mla_bwd::lds_addr(smem + b); };
+
+    // DMA: a tile is 9 loads of 1 KB of K nope, 5 of K rope, 9 of V (slot s of a region is row
+    // s / SPR, chunk s % SPR; the padding chunks read out of bounds, as 0). Wave w issues loads
+    // w + NW u, u = 0 .. 5 (wave 3's last repeats its fifth). Rounds 0, 1 load K nope, 4, 5 V;
+    // round 2 is K nope for wave 0 and K rope for the others, round 3 K rope for waves 0, 1 and V
+    // for 2, 3: four descriptors, each pointing at the tile to load.
+    constexpr int SPR_N = LD_KN * 2 / 16, SPR_R = LD_KR * 2 / 16, SPR_V = LD_V * 2 / 16;
+    constexpr int J_N = KC * SPR_N / 64, J_R = KC * SPR_R / 64, J_V = KC * SPR_V / 64, XR = 6;
+    static_assert(KC * SPR_N % 64 == 0 && KC * SPR_R % 64 == 0 && KC * SPR_V % 64 == 0 && J_N == 9 && J_R == 5 && J_V == 9 && NW == 4,
+                  "the rounds below");
+    constexpr int OOB = 1 << 30;
+    // The lanes' byte offsets of load jj of a region (jj wave-uniform; the divisors are constants).
+    auto os_n = [&](int jj) {
+        const unsigned int sl = 64u * jj + lane, c = sl % SPR_N;
+        const int in = -static_cast<int>(c < D_NOPE / 8);  // all ones in a chunk of the row, 0 in its padding
+        return (static_cast<int>(sl / SPR_N * (k.stride_k_n * 2) + c * 16) & in) | (OOB & ~in);
+    };
+    auto os_r = [&](int jj) {
+        const unsigned int sl = 64u * jj + lane, c = sl % SPR_R;
+        const int in = -static_cast<int>(c < D_ROT / 8);  // all ones in a chunk of the row, 0 in its padding
+        return (static_cast<int>(sl / SPR_R * (k.stride_k_rot_n * 2) + c * 16) & in) | (OOB & ~in);
+    };
+    auto os_v = [&](int jj) {
+        const unsigned int sl = 64u * jj + lane, c = sl % SPR_V;
+        const int in = -static_cast<int>(c < D_V / 8);  // all ones in a chunk of the row, 0 in its padding
+        return (static_cast<int>(sl / SPR_V * (k.stride_v_n * 2) + c * 16) & in) | (OOB & ~in);
+    };
+    // readfirstlane: the compiler makes these selects in VALU, with the lanes' offsets'.
+    auto u_lds = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+    const int j5 = w == 3 ? 5 : w + 6;
+    int x_lds[XR], x_os[XR];
+    x_lds[0] = u_lds(OFF_KN * 2 + w * 1024);
+    x_os[0]  = os_n(w);
+    x_lds[1] = u_lds(OFF_KN * 2 + (w + 4) * 1024);
+    x_os[1]  = os_n(w + 4);
+    x_lds[2] = u_lds(w == 0 ? OFF_KN * 2 + 8 * 1024 : OFF_KR * 2 + (w - 1) * 1024);
+    x_os[2]  = w == 0 ? os_n(8) : os_r(w - 1);
+    x_lds[3] = u_lds(w < 2 ? OFF_KR * 2 + (w + 3) * 1024 : OFF_V * 2 + (w - 2) * 1024);
+    x_os[3]  = w < 2 ? os_r(w + 3) : os_v(w - 2);
+    x_lds[4] = u_lds(OFF_V * 2 + (w + 2) * 1024);
+    x_os[4]  = os_v(w + 2);
+    x_lds[5] = u_lds(OFF_V * 2 + j5 * 1024);
+    x_os[5]  = os_v(j5);
+#pragma unroll
+    for(int u = 0; u < XR; u++)
+    {
+        asm volatile("" : "+s"(x_lds[u]));
+        pin(x_os[u]);
+    }
+
+    // Fragments of one K step or N tile, at a per-lane LDS address plus an immediate.
+    auto lay_b     = [&](auto ld, const auto& c) { return opus::partition_layout_b<8>(mma_k1, opus::make_tuple(ld, 1_I), c); };
+    const auto c_0 = opus::make_tuple(0_I, 0_I, 0_I, 0_I);
+    const auto of_kn = opus::layout_to_offsets<8>(lay_b(number<LD_KN>{}, c_0));
+    const auto of_kr = opus::layout_to_offsets<8>(lay_b(number<LD_KR>{}, c_0));
+    const auto of_v  = opus::layout_to_offsets<8>(lay_b(number<LD_V>{}, c_0));
+    int ob_kn  = (opus::layout_to_offsets<8>(lay_b(number<LD_KN>{}, c_ab))[0] - of_kn[0]) * 2;
+    int ob_kr  = (opus::layout_to_offsets<8>(lay_b(number<LD_KR>{}, c_ab))[0] - of_kr[0]) * 2;
+    int ob_v   = (opus::layout_to_offsets<8>(lay_b(number<LD_V>{}, c_ab))[0] - of_v[0]) * 2;
+    int ob_tkn = gated_mla_bwd::tr_c_order_lane<LD_KN>(lane) * 2;
+    int ob_tkr = gated_mla_bwd::tr_c_order_lane<LD_KR>(lane) * 2;
+    pin(ob_kn);
+    pin(ob_kr);
+    pin(ob_v);
+    // K^T's per-lane addresses are V's plus cv_n, cv_r.
+    int cv_n = (OFF_KN - OFF_V) * 2 + ob_tkn - ob_v, cv_r = (OFF_KR - OFF_V) * 2 + ob_tkr - ob_v;
+    pin(cv_n);
+    pin(cv_r);
+    auto at   = [](unsigned int a) { return opus::make_smem(reinterpret_cast<bf16_t*>(static_cast<__UINTPTR_TYPE__>(a))); };
+    auto addr = [&](int b, int off, int ob) {
+        unsigned int sb = gated_mla_bwd::lds_addr(smem + b + off);
+        asm volatile("" : "+s"(sb));
+        unsigned int a = sb + static_cast<unsigned int>(ob);
+        pin(a);
+        return a;
+    };
+    // Tile 0's K and V, and K^T: the loop's first dQ block is of no tile (its dS is 0, but what it
+    // reads must be finite) and reads tile 0's. At the end of an iteration K^T's addresses are
+    // taken from V's, then V's go a tile on.
+    unsigned int a_kn = addr(0, OFF_KN, ob_kn), a_kr = addr(0, OFF_KR, ob_kr), a_v = addr(0, OFF_V, ob_v);
+    unsigned int a_tkn = addr(0, OFF_KN, ob_tkn), a_tkr = addr(0, OFF_KR, ob_tkr);
+    auto rd_k = [&](int tn, int ks) -> bvec<8> {
+        return ks < KS_N ? at(a_kn).template load<8>(of_kn[tn] + ks * 32) : at(a_kr).template load<8>(of_kr[tn] + (ks - KS_N) * 32);
+    };
+    auto rd_v = [&](int tn, int ks) -> bvec<8> { return at(a_v).template load<8>(of_v[tn] + ks * 32); };
+    // One transposed read of K's N tile gn (16 columns), half hh of the tile's 32 keys.
+    auto rd_t = [&](int gn, int hh) {
+        return gn < NGN ? gated_mla_bwd::tr_read(at(a_tkn), gn * 16 + hh * 16 * LD_KN)
+                        : gated_mla_bwd::tr_read(at(a_tkr), (gn - NGN) * 16 + hh * 16 * LD_KR);
+    };
+    auto b_tr = [](const u32x2_t (&hv)[2]) { return u32x4_t{hv[0][0], hv[0][1], hv[1][0], hv[1][1]}; };
+    auto acc1 = [](f32x4_t& ac, const u32x4_t& a, const u32x4_t& b) {
+        asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %0" : "+a"(ac) : "v"(a), "v"(b));
+    };
+
+    float lse2[MR], dd[MR];        // this wave's LSE log2 e and D, per M tile
+    f32x4_t nd4[MR];               // -D four times over: where dP's accumulators start (GMLA_DP_MINUS_D)
+    bvec<8> bq[3], bv[3];          // B fragments of S and dP: the one in use and the next two
+    u32x2_t tb[3][2];              // B of dQ: this N tile's two reads and the next two's
+    opus::vector_t<float, NS> v_sp, v_dp;
+    opus::vector_t<bf16_t, MR * 8> a_ds;
+    f32x4_t c_old{0.0f, 0.0f, 0.0f, 0.0f};  // what a C tile's last MFMA accumulates onto
+#pragma unroll
+    for(int e = 0; e < NS; e++)
+    {
+        v_sp[e] = 0.0f;  // P and dS of the tile before the first are 0
+        v_dp[e] = 0.0f;
+    }
+#pragma unroll
+    for(int e = 0; e < MR * 8; e++)
+        a_ds[e] = static_cast<bf16_t>(0.0f);
+    // One MFMA of S (va is Q, vacc S) or dP (dO, dP) onto C tile tl. The first K step (step 0,
+    // from 0) and the steps between (1, in place) are asm; the last (2) is the compiler's MFMA.
+    // The compiler's may put its result in other registers and hand the old ones to the unit's
+    // next instruction, which then stands three s_nop behind the MFMA that reads them: the last
+    // step keeps the old ones (c_old) to the end of its unit.
+    auto mm = [&](const auto& va, int ia, const bvec<8>& fb, auto& vacc, int tl, int step, const f32x4_t* c0 = nullptr) __attribute__((always_inline)) {
+        bvec<8> fa;
+        f32x4_t cc;
+#pragma unroll
+        for(int x = 0; x < 8; x++)
+            fa[x] = va[ia * 8 + x];
+        if(step == 0)
+        {
+            // From 0, or from what the accumulator starts at (c0: -D for dP).
+            if(c0)
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %3" : "=&v"(cc) : "v"(fa), "v"(fb), "v"(*c0));
+            else
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, 0" : "=&v"(cc) : "v"(fa), "v"(fb));
+        }
+        else
+        {
+#pragma unroll
+            for(int p_ = 0; p_ < 4; p_++)
+                cc[p_] = vacc[tl * 4 + p_];
+            if(step == 1)
+                asm volatile("v_mfma_f32_16x16x32_bf16 %0, %2, %1, %0" : "+v"(cc) : "v"(fa), "v"(fb));
+            else
+            {
+                c_old = cc;
+                cc    = mma1(fa, fb, cc);
+                asm volatile("" : "+v"(cc));
+            }
+        }
+#pragma unroll
+        for(int p_ = 0; p_ < 4; p_++)
+            vacc[tl * 4 + p_] = cc[p_];
+    };
+    // The VALU of a unit is asm, as its first MFMAs are: a unit's instructions then stand in the
+    // order they are written (the compiler's own VALU goes where ISel and the scheduler put it:
+    // a unit early, or in front of the unit's read, which then issues 12 cycles late; anchors
+    // and scheduling groups held it only where the groups happened to match). What is left to
+    // the compiler in the loop: the LDS reads (chained between the asm around them), the last K
+    // step's MFMA, the descriptors' 64-bit steps and the waits. It does not know these VALU
+    // read what an MFMA wrote: the schedule keeps them 3 units behind that MFMA (it wants 11
+    // instructions between; an MFMA is done in 16 cycles).
+    auto pack = [&](int j) __attribute__((always_inline)) {
+        opus::vector_t<bf16_t, 2> h2;
+        asm volatile("v_cvt_pk_bf16_f32 %0, %1, %2" : "=v"(h2) : "v"(v_dp[2 * j]), "v"(v_dp[2 * j + 1]));
+        a_ds[2 * j]     = h2[0];
+        a_ds[2 * j + 1] = h2[1];
+    };
+    // S scale - LSE of one element, the exp (P), dP - D, dS = P (dP - D): the instructions the
+    // compiler makes of the other kernels' expressions.
+    auto fma1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_sp[e];
+        asm volatile("v_fma_f32 %0, %0, %1, -%2" : "+v"(x) : "v"(sc2), "v"(lse2[e / (NS / MR)]));
+        v_sp[e] = x;
+    };
+    auto expa = [&](int e) __attribute__((always_inline)) {
+        float x = v_sp[e];
+        asm volatile("v_exp_f32_e32 %0, %0" : "+v"(x));
+        v_sp[e] = x;
+    };
+    auto sub1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_dp[e];
+        asm volatile("v_sub_f32 %0, %0, %1" : "+v"(x) : "v"(dd[e / (NS / MR)]));
+        v_dp[e] = x;
+    };
+    auto mul1 = [&](int e) __attribute__((always_inline)) {
+        float x = v_dp[e];
+        asm volatile("v_mul_f32 %0, %1, %0" : "+v"(x) : "v"(v_sp[e]));
+        v_dp[e] = x;
+    };
+
+    // The bounds are in.
+    asm volatile("s_waitcnt lgkmcnt(0)" : "+s"(bnd_q), "+s"(bnd_k));
+    const int q0 = static_cast<int>(bnd_q), k0 = static_cast<int>(bnd_k);
+    const int seqlen_q = static_cast<int>(bnd_q >> 32) - q0, seqlen_k = static_cast<int>(bnd_k >> 32) - k0;
+    const int qb0      = qb * BQ;
+    // A block past the sequence's queries has nothing to do (no early return, as in the dK / dV body).
+    if(qb0 < seqlen_q)
+    {
+    // Bottom-right causal: query qp sees keys kv <= qp + causal_offset. The workgroup's tiles are
+    // those its last query sees, 0 .. T - 1; if it sees none the loop runs tile 0, all masked.
+    const int causal_offset = seqlen_k - seqlen_q;
+    const int q_last        = (qb0 + BQ < seqlen_q ? qb0 + BQ : seqlen_q) - 1;
+    int kv_end              = seqlen_k;
+    if(k.causal && q_last + causal_offset + 1 < kv_end)
+        kv_end = q_last + causal_offset + 1;
+    const int T = kv_end > 0 ? (kv_end + KC - 1) / KC : 0;
+    // This wave's 48 queries; rows past seqlen_q read as 0.
+    const int qw0    = qb0 + w * WQ;
+    const int rows_q = seqlen_q - qw0 < WQ ? (seqlen_q - qw0 > 0 ? seqlen_q - qw0 : 0) : WQ;
+
+    // The tiles this wave sees in full: [0, n_full). Rows past seqlen_q count as rows: Q, dO, LSE
+    // and D read as 0 there, so P is 1 and dP - D 0, and they add nothing whatever they see.
+    int n_full = seqlen_k / KC;
+    if(k.causal)
+    {
+        const int lim = qw0 + causal_offset + 1 > 0 ? (qw0 + causal_offset + 1) / KC : 0;
+        n_full        = lim < n_full ? lim : n_full;
+    }
+    here(n_full);
+
+    // LSE and D of the wave's queries first: six small loads, issued while no other is out.
+    {
+        const float* lse_p = lse_h + (q0 + qw0);
+        const float* d_p   = d_h + (q0 + qw0);
+        unsigned int ld_sz = static_cast<unsigned int>(__builtin_amdgcn_readfirstlane(rows_q * 4));
+        asm volatile("" : "+s"(lse_p), "+s"(d_p), "+s"(ld_sz));
+        auto g_lse = opus::make_gmem(lse_p, ld_sz);
+        auto g_d   = opus::make_gmem(d_p, ld_sz);
+#pragma unroll
+        for(int tm = 0; tm < MR; tm++)
+        {
+            lse2[tm] = g_lse.template load<1>(16 * tm + lane % 16)[0];
+            dd[tm]   = g_d.template load<1>(16 * tm + lane % 16)[0];
+        }
+    }
+    const char* kn_p = reinterpret_cast<const char*>(kn_h + static_cast<long long>(k0) * k.stride_k_n);
+    const char* kr_p = reinterpret_cast<const char*>(reinterpret_cast<const bf16_t*>(k.ptr_k_rot) + static_cast<long long>(k0) * k.stride_k_rot_n);
+    const char* v_p  = reinterpret_cast<const char*>(v_h + static_cast<long long>(k0) * k.stride_v_n);
+    const int rb_n = __builtin_amdgcn_readfirstlane(k.stride_k_n * 2), rb_r = __builtin_amdgcn_readfirstlane(k.stride_k_rot_n * 2);
+    const int rb_v = __builtin_amdgcn_readfirstlane(k.stride_v_n * 2);
+    const int x_rb[4] = {rb_n, __builtin_amdgcn_readfirstlane(w == 0 ? rb_n : rb_r), __builtin_amdgcn_readfirstlane(w < 2 ? rb_r : rb_v), rb_v};
+    const char* x_src[4] = {kn_p, w == 0 ? kn_p : kr_p, w < 2 ? kr_p : v_p, v_p};
+    int x_kb[4];
+    gated_mla_bwd::i32x4_t x_rs[4];
+#pragma unroll
+    for(int d = 0; d < 4; d++)
+    {
+        x_kb[d] = KC * x_rb[d];
+        x_rs[d] = gated_mla_bwd::dma_rsrc(x_src[d], 0);
+        asm volatile("" : "+s"(x_kb[d]), "+s"(x_rs[d]));
+    }
+    auto x_sizes = [&](int t) {
+        int rows = seqlen_k - t * KC;
+        asm("s_min_i32 %0, %0, %1\n\ts_max_i32 %0, %0, 0" : "+s"(rows) : "n"(KC) : "scc");
+#pragma unroll
+        for(int d = 0; d < 4; d++)
+        {
+            int nb;
+            asm("s_mul_i32 %0, %1, %2" : "=s"(nb) : "s"(rows), "s"(x_rb[d]));
+            x_rs[d] = gated_mla_bwd::i32x4_t{x_rs[d][0], x_rs[d][1], nb, 0x00020000};
+            asm volatile("" : "+s"(x_rs[d]));
+        }
+    };
+    auto x_adv = [&](int d) {
+        auto& r = x_rs[d];
+        asm volatile("" : "+s"(r));
+        unsigned long long a =
+            static_cast<unsigned int>(r[0]) | static_cast<unsigned long long>(static_cast<unsigned int>(r[1])) << 32;
+        a += static_cast<unsigned long long>(static_cast<unsigned int>(x_kb[d]));
+        r = gated_mla_bwd::i32x4_t{static_cast<int>(a), static_cast<int>(a >> 32), r[2], r[3]};
+        asm volatile("" : "+s"(r));
+    };
+    auto x_go = [&](int u, unsigned int lb) {
+        const int d = u < 2 ? 0 : (u - 1 < 3 ? u - 1 : 3);
+        asm volatile("s_add_u32 m0, %2, %3\n\tbuffer_load_dwordx4 %0, %1, 0 offen lds"
+                     :
+                     : "v"(x_os[u]), "s"(x_rs[d]), "s"(lb), "s"(x_lds[u])
+                     : "m0", "scc");
+    };
+
+    // Tiles 0 and 1 to LDS (buffers 0 and 1), ahead of Q and dO: the memory pipeline is at them
+    // while the 30 loads of Q and dO are issued.
+    {
+        unsigned int lb0 = lds_of(0), lb1 = lds_of(SZ_BUF);
+        asm volatile("" : "+s"(lb0), "+s"(lb1));
+        x_sizes(0);
+#pragma unroll
+        for(int u = 0; u < XR; u++)
+            x_go(u, lb0);
+#pragma unroll
+        for(int d = 0; d < 4; d++)
+            x_adv(d);
+        x_sizes(1);
+#pragma unroll
+        for(int u = 0; u < XR; u++)
+            x_go(u, lb1);
+        // Descriptor 0 goes a tile on past its rounds, the others in front of theirs.
+        x_adv(0);
+        x_sizes(2);
+    }
+    // This wave's queries as the A operand of S and dP, in registers.
+    auto g_q  = opus::make_gmem(q_h + static_cast<long long>(q0 + qw0) * k.stride_q_n, rec(static_cast<long long>(rows_q) * k.stride_q_n, 2));
+    auto g_do = opus::make_gmem(do_h + static_cast<long long>(q0 + qw0) * k.stride_do_n, rec(static_cast<long long>(rows_q) * k.stride_do_n, 2));
+    const auto v_qw  = g_q.template load<8>(opus::partition_layout_a<8>(mma_s, opus::make_tuple(k.stride_q_n, 1_I), c_ab));
+    const auto v_dow = g_do.template load<8>(opus::partition_layout_a<8>(mma_dp, opus::make_tuple(k.stride_do_n, 1_I), c_ab));
+    {
+        // Loop-carried scalars, at the top of the iteration of S tile ts: lbc, lbp the LDS address
+        // of tile ts - 1's buffer and of tile ts - 2's (the DMA's target, tile ts + 2 goes there);
+        // dlt the LDS addresses' step from tile ts - 1's buffer to tile ts's (from tile ts's to the
+        // next past S unit 25); rc tile ts's buffer in the ring (0 .. 3), dn the step from it to
+        // the next (-3 buffers past the last, without flags: single scalars go anywhere);
+        // ra = seqlen_k - (ts + 4) KC (negative: tile ts + 3 is not a full one), nf = n_full - 1
+        // - ts (negative: mask), z = ts - T.
+        constexpr int SZB = SZ_BUF * 2;
+        static_assert(NBUF == 4, "the ring's wrap below");
+        int rc = 0, dn = 0;
+        int dlt = -(NBUF - 1) * SZB;
+        unsigned int lbc = lds_of((NBUF - 1) * SZ_BUF), lbp = lds_of((NBUF - 2) * SZ_BUF);
+        int ra = seqlen_k - 4 * KC, nf = n_full - 1, z = -T;
+        asm volatile("" : "+s"(rc), "+s"(dlt), "+s"(lbc), "+s"(lbp));
+        asm volatile("" : "+s"(ra), "+s"(nf), "+s"(z));
+
+        namespace sch = gated_mla_bwd_dq4s;
+        // A unit's VALU from its row of the schedule. The rows are read in constant expressions
+        // and passed by value (the tables are globals of the device module otherwise, whose loads
+        // do not fold).
+        auto v_run = [&](sch::vop o0, sch::vop o1, sch::vop o2) __attribute__((always_inline)) {
+            const sch::vop os[3] = {o0, o1, o2};
+#pragma unroll
+            for(int i = 0; i < 3; i++)
+            {
+                const int kd = os[i].k, e = os[i].e;
+                if(kd == sch::V_PACK)
+                    pack(e);
+                if(kd == sch::V_FMA)
+                    fma1(e);
+                if(kd == sch::V_EXP)
+                    expa(e);
+                if(kd == sch::V_SUB)
+                    sub1(e);
+                if(kd == sch::V_MUL)
+                    mul1(e);
+                if(kd == sch::V_AKN)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_kn) : "s"(dlt));
+                if(kd == sch::V_AKR)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_kr) : "s"(dlt));
+                if(kd == sch::V_AV)
+                    asm volatile("v_add_u32 %0, %1, %0" : "+v"(a_v) : "s"(dlt));
+                if(kd == sch::V_ATKN)
+                    asm volatile("v_add_u32 %0, %1, %2" : "=v"(a_tkn) : "v"(a_v), "v"(cv_n));
+                if(kd == sch::V_ATKR)
+                    asm volatile("v_add_u32 %0, %1, %2" : "=v"(a_tkr) : "v"(a_v), "v"(cv_r));
+            }
+        };
+        auto r_run = [&](sch::rop r) __attribute__((always_inline)) {
+            if(r.k == sch::R_K)
+                bq[r.a % 3] = rd_k(r.a / KS, r.a % KS);
+            if(r.k == sch::R_V)
+                bv[r.a % 3] = rd_v(r.a / KSV, r.a % KSV);
+            if(r.k == sch::R_T)
+                tb[r.a % 3][r.b] = rd_t(r.a, r.b);
+        };
+
+        // S of tile ts, 36 units: fragment f = u / 3 (N tile f / 6, K step f % 6) for M tile
+        // u % 3. It follows the barrier, behind which VALU stands still for some 100 cycles while
+        // MFMA, LDS reads, DMA and scalars run on: its first 7 units carry reads, two DMA rounds
+        // and scalar pairs (the DMA descriptors' 64-bit steps). A unit takes one scalar (or wait,
+        // or the s_nop of an anchor) and two of read and VALU behind its MFMA, a second scalar
+        // for one of those; a DMA round takes a unit's two.
+        auto s_block = [&]() __attribute__((always_inline)) {
+            int rare = 0;
+            opus::static_for<NT * KS * MR>([&](auto U) {
+                constexpr int u = decltype(U)::value, f = u / MR, j = u % MR, tn = f / KS, ks = f % KS;
+                constexpr sch::vop o0 = sch::S_V[u][0], o1 = sch::S_V[u][1], o2 = sch::S_V[u][2];
+                constexpr sch::rop rs = sch::S_R[u];
+                constexpr int xr = sch::S_X[u];
+                mm(v_qw, j * KS + ks, bq[f % 3], v_sp, NT * j + tn, ks == 0 ? 0 : (ks == KS - 1 ? 2 : 1));
+                if(u % 3 == 2 && u <= 32)
+                    touch(bq[(u + 1) / 3 % 3]);
+                if(u == 34)
+                    touch(bv[0]);
+                // The DMA's descriptors a tile on: 1 .. 3 in front of their rounds, 0 past its.
+                if(u == 0)
+                    x_adv(2);
+                if(u == 3)
+                    x_adv(1);
+                if(u == 6)
+                    x_adv(0);
+                if(u == 9)
+                    x_adv(3);
+                // The ring a buffer on: rc = (rc + 1) & 3, dn = rc == 0 ? -3 buffers : 1 buffer.
+                // Single scalars: one to a unit that has no wait.
+                if(u == 2)
+                    asm volatile("s_add_i32 %0, %0, 1" : "+s"(rc) : : "scc");
+                if(u == 5)
+                    asm volatile("s_and_b32 %0, %0, 3" : "+s"(rc) : : "scc");
+                if(u == 12)
+                    asm volatile("s_sub_i32 %0, %1, 1" : "=s"(dn) : "s"(rc) : "scc");
+                if(u == 15)
+                    asm volatile("s_ashr_i32 %0, %0, 31" : "+s"(dn) : : "scc");
+                if(u == 18)
+                    asm volatile("s_and_b32 %0, %0, %1" : "+s"(dn) : "n"(-NBUF * SZB) : "scc");
+                if(u == 21)
+                    asm volatile("s_add_i32 %0, %0, %1" : "+s"(dn) : "n"(SZB) : "scc");
+                // Past the last round: the DMA's target and the address step a tile on.
+                if(u == 22)
+                    asm volatile("s_mov_b32 %0, %1" : "=s"(lbp) : "s"(lbc));
+                if(u == 24)
+                    asm volatile("s_add_u32 %0, %0, %1" : "+s"(lbc) : "s"(dlt) : "scc");
+                if(u == 25)
+                    asm volatile("s_mov_b32 %0, %1" : "=s"(dlt) : "s"(dn));
+                // The counters on; the rare cases' sign from the S tile's ra and nf first.
+                if(u == 27)
+                    asm volatile("s_add_i32 %0, %0, 1" : "+s"(z) : : "scc");
+                if(u == 28)
+                {
+                    rare = ra | nf;
+                    here(rare);
+                }
+                if(u == 30)
+                    asm volatile("s_sub_i32 %0, %0, %1" : "+s"(ra) : "n"(KC) : "scc");
+                if(u == 31)
+                    asm volatile("s_sub_i32 %0, %0, 1" : "+s"(nf) : : "scc");
+                r_run(rs);
+                if(xr >= 0)
+                    x_go(xr >= 0 ? xr : 0, lbp);
+                v_run(o0, o1, o2);
+                if(ks == KS - 1)
+                    touch(c_old);
+                fence();
+            });
+            return rare;
+        };
+        // The rare cases: tile ts + 3 is not a full one (its sizes), this wave does not see tile
+        // ts in full: the elements it does not see take P = 0 where the exp is made already,
+        // else an S (or S scale - LSE) that exps to 0.
+        auto rare_fix = [&](int ts) {
+            if(seqlen_k - (ts + 4) * KC < 0)
+                x_sizes(ts + 3);
+            if(ts >= n_full)
+            {
+                // Element e is row 16 (e / 8) + lane % 16 of the wave, key 16 (e / 4 % 2) +
+                // 4 (lane / 16) + e % 4 of the tile; xm[M tile] is the last key of the tile that
+                // row sees less the lane's 4 (lane / 16) (causal: a key is seen if kv <= qp +
+                // causal_offset, which is below seqlen_k for a row below seqlen_q).
+                const int kv0 = ts * KC;
+                int xm[MR];
+#pragma unroll
+                for(int m = 0; m < MR; m++)
+                    xm[m] = (k.causal ? qw0 + causal_offset + 16 * m + lane % 16 : seqlen_k - 1) - kv0 - 4 * (lane / 16);
+                // The mask, four elements (one C tile) at a time: four compares into scalar pairs, then
+                // the four selects. A select then stands three instructions behind its compare; left
+                // to the compiler, each pair takes two s_nop between them (a rare iteration was 400
+                // cycles of masking).
+                float m_z = 0.0f, m_n = -1e30f;
+                pin(m_z);
+                pin(m_n);
+                opus::static_for<NS / 4>([&](auto G) {
+                    constexpr int gt = decltype(G)::value, c0 = 16 * (gt % NT), e0 = 4 * gt;
+                    float x0 = v_sp[e0], x1 = v_sp[e0 + 1], x2 = v_sp[e0 + 2], x3 = v_sp[e0 + 3];
+                    unsigned long long t0, t1, t2, t3;
+                    asm volatile("v_cmp_ge_i32 %4, %8, %13\n\tv_cmp_ge_i32 %5, %8, %14\n\tv_cmp_ge_i32 %6, %8, %15\n\tv_cmp_ge_i32 %7, %8, %16\n\t"
+                                 "v_cndmask_b32 %0, %9, %0, %4\n\tv_cndmask_b32 %1, %10, %1, %5\n\tv_cndmask_b32 %2, %11, %2, %6\n\tv_cndmask_b32 %3, %12, %3, %7"
+                                 : "+v"(x0), "+v"(x1), "+v"(x2), "+v"(x3), "=&s"(t0), "=&s"(t1), "=&s"(t2), "=&s"(t3)
+                                 : "v"(xm[gt / NT]), "v"((sch::S_EXPD >> e0 & 1) ? m_z : m_n), "v"((sch::S_EXPD >> (e0 + 1) & 1) ? m_z : m_n),
+                                   "v"((sch::S_EXPD >> (e0 + 2) & 1) ? m_z : m_n), "v"((sch::S_EXPD >> (e0 + 3) & 1) ? m_z : m_n),
+                                   "n"(c0), "n"(c0 + 1), "n"(c0 + 2), "n"(c0 + 3));
+                    v_sp[e0]     = x0;
+                    v_sp[e0 + 1] = x1;
+                    v_sp[e0 + 2] = x2;
+                    v_sp[e0 + 3] = x3;
+                });
+            }
+        };
+        // dP(ts), 24 units: fragment f = u / 3 (N tile f / 4, K step f % 4) for M tile u % 3.
+        auto dp_block = [&]() __attribute__((always_inline)) {
+            opus::static_for<NT * KSV * MR>([&](auto U) {
+                constexpr int u = decltype(U)::value, f = u / MR, j = u % MR, tn = f / KSV, ks = f % KSV;
+                constexpr sch::vop o0 = sch::P_V[u][0], o1 = sch::P_V[u][1], o2 = sch::P_V[u][2];
+                constexpr sch::rop rs = sch::P_R[u];
+                mm(v_dow, j * KSV + ks, bv[f % 3], v_dp, NT * j + tn, ks == 0 ? 0 : (ks == KSV - 1 ? 2 : 1),
+                   GMLA_DP_MINUS_D && ks == 0 ? &nd4[j] : nullptr);
+                if(u % 3 == 2 && u <= 20)
+                    touch(bv[(u + 1) / 3 % 3]);
+                if(u == 23)
+                    touch2(tb[0][0], tb[0][1]);
+                r_run(rs);
+                v_run(o0, o1, o2);
+                if(ks == KSV - 1)
+                    touch(c_old);
+                fence();
+            });
+        };
+        // dQ of the tile before (of the last tile in the tail), 36 units of 3 per N tile; the
+        // first two of an N tile read K^T two N tiles ahead (the last N tiles' the next S's first
+        // fragments, then nothing). The waits before the barrier: this wave's DMA loads, issued
+        // in this iteration's S block, are in.
+        auto dq_block = [&](bool tail) __attribute__((always_inline)) {
+            opus::static_for<NG * MR>([&](auto U) {
+                constexpr int q = decltype(U)::value, gn = q / MR, m = q % MR;
+                constexpr sch::vop o0 = sch::Q_V[q][0], o1 = sch::Q_V[q][1], o2 = sch::Q_V[q][2];
+                acc1(acc[m][gn], gated_mla_bwd::frag8(a_ds, m), b_tr(tb[gn % 3]));
+                if(m == 2 && gn + 1 < NG)
+                    touch2(tb[(gn + 1) % 3][0], tb[(gn + 1) % 3][1]);
+                if(!tail && gn == NG - 1 && m == 1)
+                {
+                    touch(bq[0]);
+                    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                }
+                if(m < 2 && gn + 2 < NG)
+                    tb[(gn + 2) % 3][m] = rd_t(gn + 2, m);
+                if(!tail && m < 2 && gn == NG - 2)
+                    bq[m] = rd_k(0, m);
+                if(!tail)
+                    v_run(o0, o1, o2);
+                fence();
+            });
+        };
+
+        // Q, dO, LSE and D are in registers and this wave's loads of tiles 0 and 1 in LDS (0x0f70 is
+        // s_waitcnt vmcnt(0), as an instruction the compiler sees: it then waits for none of them
+        // inside the loop); every wave's are behind the barrier. LSE log2 e (0x3fb8aa3b).
+        __builtin_amdgcn_s_waitcnt(0x0f70);
+#pragma unroll
+        for(int tm = 0; tm < MR; tm++)
+            asm volatile("v_mul_f32 %0, 0x3fb8aa3b, %0" : "+v"(lse2[tm]));
+#if GMLA_DP_MINUS_D
+#pragma unroll
+        for(int tm = 0; tm < MR; tm++)
+        {
+            float nd = dd[tm];
+            asm volatile("v_xor_b32 %0, 0x80000000, %0" : "+v"(nd));
+            nd4[tm] = f32x4_t{nd, nd, nd, nd};
+            asm volatile("" : "+v"(nd4[tm]));
+        }
+#endif
+        barrier();
+        bq[0] = rd_k(0, 0);
+        bq[1] = rd_k(0, 1);
+        touch(bq[0]);
+        // The loop starts on a 64-byte boundary: where its code lies decides whether the branch
+        // of the rare cases (not taken) costs 4 cycles or 20, and with the kernel's code in front
+        // of it shifting by 4 or 8 bytes the iteration went from 1628 cycles to 1644.
+        asm volatile(".p2align 6");
+        do
+        {
+            // Every wave is past dQ's reads of tile ts - 2, whose buffer this S block's DMA
+            // overwrites, and has its loads of tile ts + 1 in.
+            barrier();
+            const int rare = s_block();
+            if(__builtin_expect(rare < 0, 0))
+                rare_fix(z - 1 + T);
+            dp_block();
+            dq_block(false);
+        } while(__builtin_expect(z < 0, 1));
+        // The last tile's dQ: its dS to bf16, its first two N tiles' fragments of K^T (whose
+        // addresses the last iteration left on it).
+#pragma unroll
+        for(int jp = 0; jp < NS / 2; jp++)
+            pack(jp);
+#pragma unroll
+        for(int x = 0; x < 4; x++)
+            tb[x / 2][x % 2] = rd_t(x / 2, x % 2);
+        dq_block(true);
+    }
+    // The loads still out go to LDS; the accumulators' last MFMAs finish.
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    gated_mla_bwd::mfma_acc_drain();
+    // The accumulators are read from here on: the compiler does not know the asm MFMAs' latency
+    // and would read one right behind the MFMA that writes it.
+#pragma unroll
+    for(int m = 0; m < MR; m++)
+#pragma unroll
+        for(int n = 0; n < NG; n++)
+            asm volatile("" : "+a"(acc[m][n]));
+    auto g_dq = opus::make_gmem(dq_h + static_cast<long long>(q0 + qw0) * k.stride_dq_n,
+                                rec(static_cast<long long>(rows_q) * k.stride_dq_n, 2));
+    // The C fragments hold 4 columns of 16 rows per instruction; stored like that, every lane is
+    // a memory request of its own (a store of 64 lanes then takes 256 cycles to issue). Each
+    // wave transposes its 48 rows through LDS instead (free once every wave's DMA writes are in:
+    // the barrier) and stores whole rows, 64 lanes x 8 bf16 on end; rows past seqlen_q fall
+    // outside the descriptor and are dropped.
+    __syncthreads();
+    {
+        constexpr int LD_O = D_QK + 16;
+        static_assert(NW * WQ * LD_O <= SMEM_ELEMS && WQ * (D_QK / 8) % 64 == 0, "staging fits; whole instructions");
+        bf16_t* s_o = smem + w * WQ * LD_O;
+        // C tile (m, n): row 16 m + lane % 16, columns 16 n + 4 (lane / 16) + 0 .. 3.
+        const int c_row = lane % 16, c_col = 4 * (lane / 16);
+#pragma unroll
+        for(int m = 0; m < MR; m++)
+#pragma unroll
+            for(int n = 0; n < NG; n++)
+                *reinterpret_cast<bvec<4>*>(s_o + (16 * m + c_row) * LD_O + 16 * n + c_col) = opus::cast<bf16_t>(acc[m][n] * k.softmax_scale);
+        constexpr int OC = D_QK / 8;  // 8-element chunks of a row
+#pragma unroll
+        for(int it = 0; it < WQ * OC / 64; it++)
+        {
+            const int ch = it * 64 + lane, row = ch / OC, col = ch % OC * 8;
+            g_dq.template store<8>(*reinterpret_cast<const bvec<8>*>(s_o + row * LD_O + col), row * k.stride_dq_n + col);
+        }
+    }
+    }
+}
+
+
+// The 4-wave backward: the dK / dV pass and the dQ pass in one launch, a workgroup id being of
+// one or the other by its place in the grid. 4 waves, one per SIMD; a pass with no blocks takes
+// no workgroups. The kernel reads its arguments (three scalar loads, the accumulators' zeros
+// behind them: the 36 tiles both passes have) and hands over to the pass's body.
+__global__ __launch_bounds__(gated_mla_bwd_4w::BLOCK, 1) void gated_mla_bwd_4w_kernel(gated_mla_bwd_4w_kargs k_)
+{
+    using gated_mla_bwd::bf16_t;
+    using gated_mla_bwd::f32x4_t;
+    constexpr int SMEM = gated_mla_bwd_4w::SMEM_ELEMS > gated_mla_bwd_dq4::SMEM_ELEMS ? gated_mla_bwd_4w::SMEM_ELEMS : gated_mla_bwd_dq4::SMEM_ELEMS;
+    static_assert(gated_mla_bwd_4w::BLOCK == gated_mla_bwd_dq4::BLOCK, "one workgroup shape");
+    __shared__ __attribute__((aligned(16))) bf16_t smem[SMEM];
+
+    const int tid  = static_cast<int>(opus::thread_id_x());
+    const int lane = tid % 64;
+    const int w    = __builtin_amdgcn_readfirstlane(tid / 64);
+    gated_mla_bwd_4w_kargs k = k_;
+
+    // The asm keeps the zeros here, as values of registers and not constants to make again
+    // where they are used.
+    f32x4_t z[3][12];
+#pragma unroll
+    for(int m = 0; m < 3; m++)
+#pragma unroll
+        for(int n = 0; n < 12; n++)
+        {
+            z[m][n] = f32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
+            asm volatile("" : "+a"(z[m][n]));
+        }
+    // Every argument goes through here: one batch of loads, one wait behind the zeros. (In and
+    // out: as inputs only, the compiler moves some of them to other registers in front of the
+    // last load, with a wait of its own.)
+    asm volatile("" : "+s"(k.ptr_q), "+s"(k.ptr_k_nope), "+s"(k.ptr_v), "+s"(k.ptr_k_rot), "+s"(k.ptr_do), "+s"(k.ptr_lse));
+    asm volatile("" : "+s"(k.ptr_d), "+s"(k.ptr_seqstart_q), "+s"(k.ptr_seqstart_k), "+s"(k.ptr_dq), "+s"(k.ptr_dkv), "+s"(k.ptr_dk_rope));
+    asm volatile("" : "+s"(k.H), "+s"(k.num_seqs), "+s"(k.n_kv_blocks), "+s"(k.n_q_blocks), "+s"(k.hg), "+s"(k.causal), "+s"(k.softmax_scale));
+    asm volatile("" : "+s"(k.stride_k_rot_n), "+s"(k.stride_q_n), "+s"(k.stride_q_h), "+s"(k.stride_k_n), "+s"(k.stride_k_h), "+s"(k.stride_v_n));
+    asm volatile("" : "+s"(k.stride_v_h), "+s"(k.stride_do_n), "+s"(k.stride_do_h), "+s"(k.stride_lse_h), "+s"(k.stride_dq_n), "+s"(k.stride_dq_h));
+    asm volatile("" : "+s"(k.stride_dkv_n), "+s"(k.stride_dkv_h), "+s"(k.stride_dkr_n), "+s"(k.stride_dkr_h), "+s"(k.div_magic));
+
+    // The workgroup's place is its place in the grid (gated_mla_bwd_4w_kargs). With a causal mask
+    // (by_group) z is the group and the sequence, y the block of the dK / dV pass, then of the dQ
+    // pass; without, z is the sequence and the pass, y the group and the block. x is the head in
+    // its group.
+    // readfirstlane: these are scalars, and must stay so for the DMA's descriptors and m0.
+    auto sc = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+    const int gy = static_cast<int>(opus::block_id_y()), gz = static_cast<int>(opus::block_id_z());
+    const int both     = (k.n_kv_blocks > 0 && k.n_q_blocks > 0) ? 1 : 0;
+    const int nbm      = k.n_kv_blocks > k.n_q_blocks ? k.n_kv_blocks : k.n_q_blocks;
+    const int by_group = k.causal ? 1 : 0;
+    // The coordinate that holds the group, over what it counts there (div_magic).
+    const int dv   = by_group ? gz : gy;
+    const int grp  = static_cast<int>((static_cast<unsigned long long>(static_cast<unsigned int>(dv)) * static_cast<unsigned int>(k.div_magic)) >> 31);
+    const int rem  = dv - grp * (by_group ? k.num_seqs : nbm);
+    const int g    = sc(by_group ? rem : (both ? gz >> 1 : gz));
+    // The sequence's bounds, seqstart[g] and [g + 1] of the queries and of the keys: two scalar
+    // loads that go out here; a pass waits for them past its lanes' constants.
+    unsigned long long bnd_q, bnd_k;
+    {
+        const int* pq = k.ptr_seqstart_q + g;
+        const int* pk = k.ptr_seqstart_k + g;
+        asm volatile("s_load_dwordx2 %0, %2, 0\n\ts_load_dwordx2 %1, %3, 0" : "=&s"(bnd_q), "=&s"(bnd_k) : "s"(pq), "s"(pk));
+    }
+    const int is_q = sc(by_group ? (gy >= k.n_kv_blocks ? 1 : 0) : (both ? gz & 1 : (k.n_kv_blocks == 0 ? 1 : 0)));
+    const int nb   = is_q ? k.n_q_blocks : k.n_kv_blocks;
+    const int blk0 = by_group ? (is_q ? gy - k.n_kv_blocks : gy) : rem;
+    const int h    = sc(grp * k.hg + static_cast<int>(opus::block_id_x()));
+    // Blocks 2 and 3 of every four change places (gated_mla_bwd::wg_map's GMLA_ZIG).
+    const int blk  = sc((blk0 & 2) && (blk0 | 1) < nb ? blk0 ^ 1 : blk0);
+    // The last group's ids past H heads, the shorter pass's past its blocks.
+    if(h >= k.H || blk0 >= nb)
+    {
+        asm volatile("s_endpgm");
+        __builtin_unreachable();
+    }
+    // Each pass ends the kernel itself: with the two ends joined, the compiler turns the if / else
+    // into "if(!is_q) dK / dV; if(is_q) dQ" and keeps what the second needs (the arguments, the
+    // zeroed accumulators) alive across the first, out of registers.
+    if(is_q)
+    {
+        gated_mla_bwd_dq_4w_body(k, smem, lane, w, h, blk, bnd_q, bnd_k, z);
+        asm volatile("s_endpgm");
+        __builtin_unreachable();
+    }
+    else
+    {
+        gated_mla_bwd_dkdv_4w_body(k, smem, lane, w, h, blk, bnd_q, bnd_k, z);
+        asm volatile("s_endpgm");
+        __builtin_unreachable();
+    }
 }
 
 #else
@@ -4521,8 +6005,8 @@ __global__ void gated_mla_bwd_kernel(gated_mla_bwd_kargs) {}
 template <bool DS>
 __global__ void gated_mla_bwd_dkdv_pair_kernel(gated_mla_bwd_kargs) {}
 __global__ void gated_mla_bwd_dkdv_pair32_kernel(gated_mla_bwd_kargs) {}
-__global__ void gated_mla_bwd_dkdv_4w_kernel(gated_mla_bwd_kargs) {}
 __global__ void gated_mla_bwd_dq_kernel(gated_mla_bwd_dq_kargs) {}
+__global__ void gated_mla_bwd_4w_kernel(gated_mla_bwd_4w_kargs) {}
 __global__ void gated_mla_bwd_dq_ds_kernel(gated_mla_bwd_dq_kargs) {}
 __global__ void gated_mla_bwd_dq32_kernel(gated_mla_bwd_dq_kargs) {}
 #endif

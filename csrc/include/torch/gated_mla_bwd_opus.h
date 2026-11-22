@@ -65,6 +65,25 @@ void gated_mla_bwd_dkdv_bf16_opus(at::Tensor& q,
                                   bool causal,
                                   float softmax_scale);
 
+// The whole backward past the pre-pass in one launch: the dK / dV pass and the dQ pass (dq
+// [total_q, H, 192] bf16, written, including softmax_scale) as workgroups of one kernel.
+void gated_mla_bwd_dkdvdq_bf16_opus(at::Tensor& q,
+                                    at::Tensor& k_nope,
+                                    at::Tensor& v,
+                                    at::Tensor& k_rot,
+                                    at::Tensor& d_o,
+                                    at::Tensor& lse,
+                                    at::Tensor& d,
+                                    at::Tensor& dq,
+                                    at::Tensor& dkv,
+                                    at::Tensor& dk_rope,
+                                    at::Tensor& seqstart_q,
+                                    at::Tensor& seqstart_k,
+                                    int max_seqlen_q,
+                                    int max_seqlen_k,
+                                    bool causal,
+                                    float softmax_scale);
+
 // As gated_mla_bwd_dkdv_bf16_opus, on the 8-wave kernel whose wave pairs split by dependency chain.
 void gated_mla_bwd_dkdv_pair_bf16_opus(at::Tensor& q,
                                        at::Tensor& k_nope,
